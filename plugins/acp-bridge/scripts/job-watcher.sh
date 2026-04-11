@@ -1,24 +1,36 @@
 #!/usr/bin/env bash
 # job-watcher.sh — long-lived background ACP job transition watcher.
 #
-# Invoked by the SessionStart hook with asyncRewake: true. Polls all three
-# ACP backends (gemini, qwen, codex) on a configurable interval, detects
-# jobs that transition into a terminal state (completed/failed/etc.), and
-# exits with code 2 to wake the model via Claude Code's asyncRewake hook
-# mechanism. Also fans out notifications to notify-telegram.sh for AFK
-# push notifications when ACP_BRIDGE_TELEGRAM_CHAT_ID is configured.
+# Invoked by the SessionStart hook (asyncRewake: true, timeout 24h). Polls
+# all three ACP backends (gemini, qwen, codex) on a configurable interval
+# and detects jobs that transition into a terminal state (completed/failed/
+# etc.). On each transition:
+#   - appends a formatted report to the per-session pending-notifications
+#     file, which the UserPromptSubmit hook (inject-pending.sh) drains on
+#     the user's next message and injects as additional context
+#   - fans out the same report to notify-telegram.sh for AFK push
+#
+# The watcher then keeps polling — it does NOT exit after firing. This is
+# the "Option B" design: no asyncRewake wake (it's never sent), no re-arming
+# needed, notifications accumulate in the pending file until the next user
+# turn delivers them to the model.
 #
 # Design notes:
 # - Polls ALL three backends, not just ones tracked in $CLAUDE_ACP_SESSION_FILE
 #   (Option Y — broader coverage at the cost of occasional cross-session noise).
 # - First poll establishes a baseline; no notifications fire on startup.
-# - Re-arming after a fire requires a Claude Code session restart (asyncRewake
-#   is a once-per-hook-spawn mechanism in v0.1).
+# - Single-instance guaranteed by atomic mkdir lock (mkdir fails with EEXIST
+#   if another watcher already holds the lock — race-free unlike a PID file
+#   check-then-write).
+# - On SIGTERM from SessionEnd, the trap cleans up the lock dir and exits 0.
 #
 # Env vars:
-#   ACP_BRIDGE_WATCH_INTERVAL   — seconds between polls (default 30)
-#   ACP_TOOL_BIN                — override acp-tool path
-#   ACP_BRIDGE_TELEGRAM_CHAT_ID — if set, forward notifications via telegram
+#   ACP_BRIDGE_WATCH_INTERVAL    — seconds between polls (default 30)
+#   ACP_TOOL_BIN                 — override acp-tool path
+#   ACP_BRIDGE_TELEGRAM_CHAT_ID  — if set, forward notifications via telegram
+#   ACP_BRIDGE_WATCHER_SESSION_ID — explicit session id (bypasses stdin JSON);
+#                                   used by inject-pending.sh when respawning
+#                                   a crashed watcher
 
 set -uo pipefail
 
@@ -33,17 +45,20 @@ STATE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/claude-acp-bridge/sessions"
 # existent path and silently skip Telegram dispatch.
 PLUGIN_ROOT="$(dirname "$(dirname "$(readlink -f "$0")")")"
 
-# Read session_id from stdin JSON (same pattern as session-hook.sh).
-input=$(cat 2>/dev/null || true)
-session_id=""
-if [ -n "$input" ]; then
-  session_id=$(python3 -c "
+# Resolve session_id: prefer explicit env (respawn path), fall back to stdin
+# JSON (hook spawn path).
+session_id="${ACP_BRIDGE_WATCHER_SESSION_ID:-}"
+if [ -z "$session_id" ]; then
+  input=$(cat 2>/dev/null || true)
+  if [ -n "$input" ]; then
+    session_id=$(python3 -c "
 import json, sys
 try:
     print(json.loads(sys.stdin.read()).get('session_id', ''))
 except Exception:
     print('')
 " <<<"$input" 2>/dev/null || true)
+  fi
 fi
 
 if [ -z "$session_id" ]; then
@@ -55,27 +70,33 @@ if [ ! -x "$BIN" ]; then
 fi
 
 mkdir -p "$STATE_DIR"
-PID_FILE="$STATE_DIR/${session_id}.watcher.pid"
+LOCK_DIR="$STATE_DIR/${session_id}.watcher.lock"
 LAST_FILE="$STATE_DIR/${session_id}.lastjobs"
+PENDING_FILE="$STATE_DIR/${session_id}.pending"
 
-# Single-instance guard: if a watcher is already running for this session,
-# exit silently rather than spawning a duplicate (can happen when asyncRewake
-# re-fires the hook while the previous watcher is still in its poll loop).
-if [ -f "$PID_FILE" ]; then
-  existing_pid=$(cat "$PID_FILE" 2>/dev/null || true)
+# Single-instance guard via atomic mkdir. mkdir is guaranteed to fail with
+# EEXIST if another process won the race — no TOCTOU window like a PID file
+# check-then-write. The loser exits silently; the winner writes its PID
+# inside the lock dir so SessionEnd can signal it.
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  # Lock exists. Is the holder still alive?
+  existing_pid=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
   if [ -n "$existing_pid" ] && kill -0 "$existing_pid" 2>/dev/null; then
     exit 0
   fi
+  # Stale lock from a crashed watcher — take it over.
+  rm -rf "$LOCK_DIR"
+  mkdir "$LOCK_DIR" 2>/dev/null || exit 0
 fi
-echo $$ > "$PID_FILE"
+echo $$ > "$LOCK_DIR/pid"
 
 # Track the temp file used in the current poll iteration so the trap can
-# clean it up if SIGTERM arrives mid-loop. Normal exit paths mv or rm it.
+# clean it up if SIGTERM arrives mid-loop.
 TMP_CURRENT=""
 
 cleanup_and_exit() {
   [ -n "$TMP_CURRENT" ] && rm -f "$TMP_CURRENT"
-  rm -f "$PID_FILE"
+  rm -rf "$LOCK_DIR"
   exit 0
 }
 trap cleanup_and_exit TERM INT
@@ -88,13 +109,6 @@ trap cleanup_and_exit TERM INT
 # Expected acp-tool output format (verified via reconnaissance):
 #   JOB ID           STATUS     CREATED AT      PROMPT
 #   job_15ec13237179 failed     1775881017.86968 Reply with exactly: ...
-#
-# Parser rules:
-#   - skip blank lines
-#   - skip header line (first token literally "JOB")
-#   - skip tracebacks/errors (first token contains non-id characters)
-#   - a data line has at least two whitespace-separated tokens; token[0]
-#     must start with "job_" to be considered a job id.
 snapshot_jobs() {
   local b output
   for b in "${BACKENDS[@]}"; do
@@ -136,8 +150,7 @@ while true; do
 
   # Detect transitions: any (backend, job_id) whose current status is
   # terminal and differs from its previous status (including "not seen
-  # before"). The python block is invoked via heredoc with the file
-  # paths passed as argv to avoid embedded-quote surprises.
+  # before").
   report=$(LAST_FILE="$LAST_FILE" CURR_FILE="$TMP_CURRENT" python3 <<'PY'
 import os
 
@@ -175,24 +188,33 @@ if transitions:
         lines.append(f"  {mark} {b} job {jid}: {s}")
     lines.append("")
     lines.append("Run /acp-follow <backend> <job-id> to see the full output.")
-    lines.append("Note: re-arming the watcher requires a Claude Code session restart.")
     print("\n".join(lines))
 PY
 )
 
   if [ -n "$report" ]; then
-    # Persist the new snapshot so a re-armed watcher doesn't re-report.
+    # Persist the new snapshot so we don't re-fire on the same transition.
     mv "$TMP_CURRENT" "$LAST_FILE"
+
+    # Append the report to the pending-notifications file for the
+    # UserPromptSubmit hook to drain on the user's next turn. A blank
+    # line separates multiple reports so they stack readably if several
+    # queue up between user turns.
+    {
+      printf '%s\n\n' "$report"
+    } >> "$PENDING_FILE"
 
     # Fan out to telegram (best-effort; never fails the watcher).
     if [ -x "$PLUGIN_ROOT/scripts/notify-telegram.sh" ]; then
       printf '%s\n' "$report" | "$PLUGIN_ROOT/scripts/notify-telegram.sh" 2>/dev/null || true
     fi
 
-    printf '%s\n' "$report"
-    rm -f "$PID_FILE"
-    exit 2
+    # Continue polling — do NOT exit. Multiple transitions across the
+    # session accumulate in the pending file until drained.
+    TMP_CURRENT=""
+    continue
   fi
 
   mv "$TMP_CURRENT" "$LAST_FILE"
+  TMP_CURRENT=""
 done

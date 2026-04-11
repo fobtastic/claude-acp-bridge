@@ -13,8 +13,19 @@
             "type": "command",
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/job-watcher.sh\"",
             "asyncRewake": true,
-            "rewakeMessage": "ACP job update (auto-detected by background watcher):",
+            "rewakeMessage": "ACP job watcher daemon",
             "timeout": 86400
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/inject-pending.sh\"",
+            "timeout": 5
           }
         ]
       }
