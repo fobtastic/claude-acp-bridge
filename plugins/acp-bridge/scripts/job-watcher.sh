@@ -55,7 +55,12 @@ LAST_FILE="$STATE_DIR/${session_id}.lastjobs"
 
 echo $$ > "$PID_FILE"
 
+# Track the temp file used in the current poll iteration so the trap can
+# clean it up if SIGTERM arrives mid-loop. Normal exit paths mv or rm it.
+TMP_CURRENT=""
+
 cleanup_and_exit() {
+  [ -n "$TMP_CURRENT" ] && rm -f "$TMP_CURRENT"
   rm -f "$PID_FILE"
   exit 0
 }
@@ -79,7 +84,10 @@ trap cleanup_and_exit TERM INT
 snapshot_jobs() {
   local b output
   for b in "${BACKENDS[@]}"; do
-    output=$("$BIN" --backend "$b" jobs 2>/dev/null || true)
+    # Wrap acp-tool in `timeout` so a hung bridge socket can't freeze the
+    # watcher loop. 10s is well above normal response time (~500ms) while
+    # staying far below the default 30s poll interval.
+    output=$(timeout 10 "$BIN" --backend "$b" jobs 2>/dev/null || true)
     if [ -z "$output" ]; then
       continue
     fi
