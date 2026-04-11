@@ -22,7 +22,7 @@ After initial implementation, added a session-lifecycle feature to prevent zombi
 
 **Motivation:** ACP bridges are persistent singletons keyed on `(backend, workspace)`. Running `/acp-prompt gemini "foo"` in workspace A and then workspace B leaves two gemini-acp-bridge processes alive indefinitely. Over many Claude Code sessions, these accumulate and consume memory.
 
-**Cleanup policy:** Smart — kill idle bridges, preserve busy ones. On `SessionEnd`, for each `(backend, workspace)` tuple this session touched:
+**Cleanup policy:** Smart — kill idle bridges, preserve busy ones. On `SessionEnd`, for each backend this session touched:
 
 1. Query `acp-tool --backend <b> --workspace <w> status`
 2. Parse `activeJobs` from the JSON response
@@ -35,11 +35,11 @@ After initial implementation, added a session-lifecycle feature to prevent zombi
 
 - `plugins/acp-bridge/hooks/hooks.json` — declares `SessionStart` and `SessionEnd` hooks invoking a shell script.
 - `plugins/acp-bridge/scripts/session-hook.sh` — `start` creates a per-session state file at `~/.cache/claude-acp-bridge/sessions/<session_id>.list` and exports `CLAUDE_ACP_SESSION_FILE` via `$CLAUDE_ENV_FILE` so the plugin's command scripts can see it. `end` reads the state file, applies the smart cleanup policy, removes the file.
-- `plugins/acp-bridge/scripts/acp.sh` — modified to append `<backend>\t<$PWD>` to `$CLAUDE_ACP_SESSION_FILE` (dedup via `grep -qxF`) before each bridge invocation. Only active when the env var is set (i.e., inside a Claude Code session); direct shell invocations don't track.
+- `plugins/acp-bridge/scripts/acp.sh` — modified to append `<backend>` to `$CLAUDE_ACP_SESSION_FILE` (dedup via `grep -qxF`) before each bridge invocation. Only active when the env var is set (i.e., inside a Claude Code session); direct shell invocations don't track. **Note: tracking is per backend, not per (backend, workspace), because `acp-tool` treats each backend as a global singleton process — `--workspace` only controls the working directory for commands, not bridge identity.**
 
 **Known limitations:**
 
-- **Cross-session interference**: if two Claude Code sessions run in the same workspace and one ends while the other has a sync prompt in flight, the first's cleanup can kill the second's bridge mid-call. Rare; recovery is automatic (retry respawns the bridge).
+- **Cross-session interference**: any Claude Code session's `SessionEnd` can close a backend used by another concurrent session, because bridges are global singletons not partitioned by session. The `activeJobs > 0` guard protects background jobs in flight but not sync prompts in another session. Rare in practice; recovery is automatic (retry respawns the bridge).
 - **Session-scope only**: bridges started outside Claude Code (e.g., by the pi-coding-agent extension) aren't tracked, aren't cleaned up. Intentional — we only manage what we touch.
 - **State file leaks on crash**: if Claude Code terminates abnormally without firing `SessionEnd`, the state file is orphaned. Low impact — next `SessionStart` creates a new file, and the orphan is harmless (cleanup on next manual `/acp-close` or a housekeeping sweep could be added later).
 

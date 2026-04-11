@@ -4,7 +4,7 @@
 # Actions:
 #   start - Create per-session state file, export CLAUDE_ACP_SESSION_FILE via
 #           $CLAUDE_ENV_FILE so subsequent bash invocations can track which
-#           (backend, workspace) tuples this session touches.
+#           backends this session touches.
 #   end   - Read the state file and close each tracked bridge, but only if
 #           it is idle (activeJobs == 0). Bridges with active background
 #           jobs are preserved so long-running /acp-submit work survives
@@ -63,12 +63,11 @@ case "$ACTION" in
       exit 0
     fi
 
-    # Dedup and iterate tracked tuples.
-    while IFS=$'\t' read -r backend workspace; do
+    # Dedup and iterate tracked backends.
+    while IFS= read -r backend; do
       [ -z "$backend" ] && continue
-      [ -z "$workspace" ] && continue
 
-      status_json=$("$BIN" --backend "$backend" --workspace "$workspace" status 2>/dev/null || echo "{}")
+      status_json=$("$BIN" --backend "$backend" status 2>/dev/null || echo "{}")
       active_jobs=$(python3 -c "
 import json, sys
 try:
@@ -79,10 +78,10 @@ except Exception:
 " <<<"$status_json" 2>/dev/null || echo "0")
 
       if [ "$active_jobs" -gt 0 ]; then
-        echo "acp-bridge: skipping ${backend}@${workspace} — ${active_jobs} active jobs" >&2
+        echo "acp-bridge: skipping ${backend} — ${active_jobs} active jobs" >&2
       else
-        "$BIN" --backend "$backend" --workspace "$workspace" close >/dev/null 2>&1 || true
-        echo "acp-bridge: closed idle ${backend}@${workspace}" >&2
+        "$BIN" --backend "$backend" close >/dev/null 2>&1 || true
+        echo "acp-bridge: closed idle ${backend}" >&2
       fi
     done < <(sort -u "$state_file")
 
