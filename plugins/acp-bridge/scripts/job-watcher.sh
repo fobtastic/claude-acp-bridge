@@ -53,6 +53,15 @@ mkdir -p "$STATE_DIR"
 PID_FILE="$STATE_DIR/${session_id}.watcher.pid"
 LAST_FILE="$STATE_DIR/${session_id}.lastjobs"
 
+# Single-instance guard: if a watcher is already running for this session,
+# exit silently rather than spawning a duplicate (can happen when asyncRewake
+# re-fires the hook while the previous watcher is still in its poll loop).
+if [ -f "$PID_FILE" ]; then
+  existing_pid=$(cat "$PID_FILE" 2>/dev/null || true)
+  if [ -n "$existing_pid" ] && kill -0 "$existing_pid" 2>/dev/null; then
+    exit 0
+  fi
+fi
 echo $$ > "$PID_FILE"
 
 # Track the temp file used in the current poll iteration so the trap can
