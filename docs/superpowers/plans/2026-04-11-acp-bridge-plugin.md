@@ -853,6 +853,278 @@ Expected: one commit with 11 new files.
 
 ---
 
+## Task 8a: Session lifecycle hooks (smart cleanup)
+
+Added after initial implementation. Addresses the zombie-bridge problem: ACP bridges touched during a Claude Code session should be closed on session end, but only if they're idle (no background jobs in flight).
+
+**Files:**
+- Create: `~/projects/claude-acp-bridge/plugins/acp-bridge/hooks/hooks.json`
+- Create: `~/projects/claude-acp-bridge/plugins/acp-bridge/scripts/session-hook.sh`
+- Modify: `~/projects/claude-acp-bridge/plugins/acp-bridge/scripts/acp.sh` (add tracking call)
+
+### Step 8a.1: Create hooks directory
+
+```bash
+mkdir -p ~/projects/claude-acp-bridge/plugins/acp-bridge/hooks
+```
+
+### Step 8a.2: Write `hooks/hooks.json`
+
+```json
+{
+  "description": "Lifecycle hooks for tracking and cleaning up idle ACP bridges per Claude Code session",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/session-hook.sh\" start",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/session-hook.sh\" end",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Timeout 30s for `end` because it has to query status + close each tracked bridge; a slow acp-tool invocation shouldn't abort the cleanup.
+
+### Step 8a.3: Write `scripts/session-hook.sh`
+
+Handles both `start` and `end` actions. Reads Claude Code's JSON hook input from stdin.
+
+Write `~/projects/claude-acp-bridge/plugins/acp-bridge/scripts/session-hook.sh`:
+```bash
+#!/usr/bin/env bash
+# session-hook.sh — Claude Code session lifecycle hook for acp-bridge.
+#
+# Actions:
+#   start - Create per-session state file, export CLAUDE_ACP_SESSION_FILE via
+#           $CLAUDE_ENV_FILE so subsequent bash invocations can track which
+#           (backend, workspace) tuples this session touches.
+#   end   - Read the state file and close each tracked bridge, but only if
+#           it is idle (activeJobs == 0). Bridges with active background
+#           jobs are preserved so long-running /acp-submit work survives
+#           session termination.
+
+set -euo pipefail
+
+ACTION="${1:-}"
+STATE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/claude-acp-bridge/sessions"
+
+read_session_id_from_stdin() {
+  # Claude Code hooks receive JSON on stdin with a session_id field.
+  local input
+  input=$(cat 2>/dev/null || true)
+  if [ -z "$input" ]; then
+    echo ""
+    return
+  fi
+  python3 -c "
+import json, sys
+try:
+    data = json.loads(sys.stdin.read())
+    print(data.get('session_id', ''))
+except Exception:
+    print('')
+" <<<"$input"
+}
+
+case "$ACTION" in
+  start)
+    session_id=$(read_session_id_from_stdin)
+    if [ -z "$session_id" ]; then
+      # No session id — nothing to track. Exit silently.
+      exit 0
+    fi
+    mkdir -p "$STATE_DIR"
+    state_file="$STATE_DIR/$session_id.list"
+    : > "$state_file"
+    if [ -n "${CLAUDE_ENV_FILE:-}" ]; then
+      printf 'export CLAUDE_ACP_SESSION_FILE=%q\n' "$state_file" >> "$CLAUDE_ENV_FILE"
+    fi
+    ;;
+  end)
+    session_id=$(read_session_id_from_stdin)
+    if [ -z "$session_id" ]; then
+      exit 0
+    fi
+    state_file="$STATE_DIR/$session_id.list"
+    if [ ! -f "$state_file" ]; then
+      exit 0
+    fi
+
+    BIN="${ACP_TOOL_BIN:-$HOME/agent-extensions/acp-tool}"
+    if [ ! -x "$BIN" ]; then
+      rm -f "$state_file"
+      exit 0
+    fi
+
+    # Dedup and iterate tracked tuples.
+    while IFS=$'\t' read -r backend workspace; do
+      [ -z "$backend" ] && continue
+      [ -z "$workspace" ] && continue
+
+      status_json=$("$BIN" --backend "$backend" --workspace "$workspace" status 2>/dev/null || echo "{}")
+      active_jobs=$(python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    print(int(d.get('activeJobs', 0)))
+except Exception:
+    print(0)
+" <<<"$status_json" 2>/dev/null || echo "0")
+
+      if [ "$active_jobs" -gt 0 ]; then
+        echo "acp-bridge: skipping ${backend}@${workspace} — ${active_jobs} active jobs" >&2
+      else
+        "$BIN" --backend "$backend" --workspace "$workspace" close >/dev/null 2>&1 || true
+        echo "acp-bridge: closed idle ${backend}@${workspace}" >&2
+      fi
+    done < <(sort -u "$state_file")
+
+    rm -f "$state_file"
+    ;;
+  *)
+    echo "session-hook.sh: unknown action '${ACTION}' (expected 'start' or 'end')" >&2
+    exit 2
+    ;;
+esac
+```
+
+Make executable:
+```bash
+chmod +x ~/projects/claude-acp-bridge/plugins/acp-bridge/scripts/session-hook.sh
+bash -n ~/projects/claude-acp-bridge/plugins/acp-bridge/scripts/session-hook.sh && echo ok
+```
+
+### Step 8a.4: Modify `scripts/acp.sh` to track invocations
+
+Add a helper function near the top (after `is_valid_backend`, before `split_backend_and_text`) and call it from each of the three run_* functions BEFORE the actual bridge invocation.
+
+**New function:**
+```bash
+track_invocation() {
+  # Append <backend>\t<workspace> to the session state file, if tracking
+  # is active. No-op outside a Claude Code session.
+  local backend="$1"
+  local workspace="${2:-$PWD}"
+  if [ -z "${CLAUDE_ACP_SESSION_FILE:-}" ]; then
+    return 0
+  fi
+  if [ ! -f "$CLAUDE_ACP_SESSION_FILE" ]; then
+    return 0
+  fi
+  local line="${backend}	${workspace}"
+  if ! grep -qxF "$line" "$CLAUDE_ACP_SESSION_FILE" 2>/dev/null; then
+    printf '%s\n' "$line" >> "$CLAUDE_ACP_SESSION_FILE"
+  fi
+}
+```
+
+**Call sites** — add `track_invocation` before the bridge is invoked:
+
+- In `run_info_command`:
+  - In the fan-out branch (empty ARGS), call `track_invocation "$b" "$PWD"` inside the for loop before `"$BIN" ...`
+  - In the single-backend branch, call `track_invocation "$ARGS" "$PWD"` before `"$BIN" --backend "$ARGS" ...`
+- In `run_backend_only_command`: call `track_invocation "$ARGS" "$PWD"` before `"$BIN" --backend "$ARGS" ...`
+- In `run_backend_and_text_command`: call `track_invocation "$BACKEND" "$PWD"` before `"$BIN" --backend "$BACKEND" ...`
+
+### Step 8a.5: Direct bash tests
+
+**Test A — hook with no session_id:**
+```bash
+echo '{}' | bash ~/projects/claude-acp-bridge/plugins/acp-bridge/scripts/session-hook.sh start; echo "exit=$?"
+```
+Expected: exit 0, no state file created.
+
+**Test B — hook with session_id, no CLAUDE_ENV_FILE:**
+```bash
+echo '{"session_id":"test-abc"}' | bash ~/projects/claude-acp-bridge/plugins/acp-bridge/scripts/session-hook.sh start; echo "exit=$?"
+test -f ~/.cache/claude-acp-bridge/sessions/test-abc.list && echo "state file created" || echo "MISSING"
+```
+Expected: exit 0, state file exists and is empty.
+
+**Test C — acp.sh tracking with env var set:**
+```bash
+rm -f /tmp/acp-track-test.list
+: > /tmp/acp-track-test.list
+CLAUDE_ACP_SESSION_FILE=/tmp/acp-track-test.list \
+  ~/projects/claude-acp-bridge/plugins/acp-bridge/scripts/acp.sh status gemini >/dev/null 2>&1
+cat /tmp/acp-track-test.list
+```
+Expected: file contains `gemini<TAB><$PWD>` (exactly one line).
+
+**Test D — tracking dedup:**
+```bash
+CLAUDE_ACP_SESSION_FILE=/tmp/acp-track-test.list \
+  ~/projects/claude-acp-bridge/plugins/acp-bridge/scripts/acp.sh status gemini >/dev/null 2>&1
+CLAUDE_ACP_SESSION_FILE=/tmp/acp-track-test.list \
+  ~/projects/claude-acp-bridge/plugins/acp-bridge/scripts/acp.sh status gemini >/dev/null 2>&1
+wc -l < /tmp/acp-track-test.list
+```
+Expected: `1` (same tuple not added twice).
+
+**Test E — fan-out tracks all three:**
+```bash
+: > /tmp/acp-track-test.list
+CLAUDE_ACP_SESSION_FILE=/tmp/acp-track-test.list \
+  ~/projects/claude-acp-bridge/plugins/acp-bridge/scripts/acp.sh status >/dev/null 2>&1
+sort /tmp/acp-track-test.list
+```
+Expected: three lines, one each for gemini/qwen/codex, all with the same workspace.
+
+**Test F — end hook with tracked tuples, all idle:**
+```bash
+# Prepare a state file with one tuple we know is idle (gemini status showed activeJobs:0 earlier)
+mkdir -p ~/.cache/claude-acp-bridge/sessions
+printf 'gemini\t%s\n' "$PWD" > ~/.cache/claude-acp-bridge/sessions/test-end.list
+echo '{"session_id":"test-end"}' | bash ~/projects/claude-acp-bridge/plugins/acp-bridge/scripts/session-hook.sh end 2>&1; echo "exit=$?"
+test ! -f ~/.cache/claude-acp-bridge/sessions/test-end.list && echo "state file removed" || echo "STILL PRESENT"
+```
+Expected: exit 0, stderr line `acp-bridge: closed idle gemini@$PWD`, state file removed.
+
+Note: this test will actually close the gemini bridge if it's running. To avoid affecting real work, skip Test F if the gemini bridge currently has a session (run `acp-tool --backend gemini status` first to check). In practice for the implementer's testing, use a `--workspace` that is NOT in use by other work.
+
+**Regression test — acp.sh still works without tracking:**
+```bash
+unset CLAUDE_ACP_SESSION_FILE
+~/projects/claude-acp-bridge/plugins/acp-bridge/scripts/acp.sh status gemini 2>&1 | head -1; echo "exit=$?"
+```
+Expected: normal status output, exit 0. (Tracking is inactive, no errors.)
+
+### Step 8a.6: Commit
+
+```bash
+cd ~/projects/claude-acp-bridge
+git add plugins/acp-bridge/hooks/hooks.json plugins/acp-bridge/scripts/session-hook.sh plugins/acp-bridge/scripts/acp.sh docs/superpowers/specs/2026-04-11-acp-bridge-plugin-design.md docs/superpowers/plans/2026-04-11-acp-bridge-plugin.md
+git status
+git commit -m "Add session lifecycle hooks for smart bridge cleanup"
+git log --format="%h %an <%ae> %s" -3
+```
+
+### Step 8a.7: Reload and integration test
+
+User must reload Claude Code so the new hooks are registered. After reload:
+- Invoke `/acp-status gemini` from a conversation
+- Verify a state file exists at `~/.cache/claude-acp-bridge/sessions/<current-session-id>.list` with a `gemini\t<pwd>` line
+- Reload again (triggers SessionEnd → SessionStart) and verify the prior state file is cleaned up
+
+---
+
 ## Task 9: Write README.md and LICENSE
 
 **Files:**

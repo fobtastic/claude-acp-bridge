@@ -38,6 +38,24 @@ is_valid_backend() {
   esac
 }
 
+track_invocation() {
+  # Append <backend>\t<workspace> to the session state file, if tracking
+  # is active. No-op outside a Claude Code session.
+  local backend="$1"
+  local workspace="${2:-$PWD}"
+  if [ -z "${CLAUDE_ACP_SESSION_FILE:-}" ]; then
+    return 0
+  fi
+  if [ ! -f "$CLAUDE_ACP_SESSION_FILE" ]; then
+    return 0
+  fi
+  local line
+  printf -v line '%s\t%s' "$backend" "$workspace"
+  if ! grep -qxF "$line" "$CLAUDE_ACP_SESSION_FILE" 2>/dev/null; then
+    printf '%s\n' "$line" >> "$CLAUDE_ACP_SESSION_FILE"
+  fi
+}
+
 split_backend_and_text() {
   # Populates BACKEND and TEXT from $1. Splits on any run of whitespace
   # (space or tab) and trims surrounding whitespace from both halves.
@@ -66,6 +84,7 @@ run_info_command() {
   if [ -z "$ARGS" ]; then
     for b in "${BACKENDS_ALL[@]}"; do
       echo "## $b"
+      track_invocation "$b" "$PWD"
       "$BIN" --backend "$b" "$sub" || true
       echo
     done
@@ -74,6 +93,7 @@ run_info_command() {
       echo "acp-bridge: invalid backend '$ARGS' (expected gemini, qwen, or codex)" >&2
       exit 2
     fi
+    track_invocation "$ARGS" "$PWD"
     "$BIN" --backend "$ARGS" "$sub"
   fi
 }
@@ -89,6 +109,7 @@ run_backend_only_command() {
     echo "acp-bridge: invalid backend '$ARGS' (expected gemini, qwen, or codex)" >&2
     exit 2
   fi
+  track_invocation "$ARGS" "$PWD"
   "$BIN" --backend "$ARGS" "$sub"
 }
 
@@ -106,6 +127,7 @@ run_backend_and_text_command() {
     echo "acp-bridge: invalid backend '$BACKEND' (expected gemini, qwen, or codex)" >&2
     exit 2
   fi
+  track_invocation "$BACKEND" "$PWD"
   "$BIN" --backend "$BACKEND" "$sub" "$TEXT"
 }
 

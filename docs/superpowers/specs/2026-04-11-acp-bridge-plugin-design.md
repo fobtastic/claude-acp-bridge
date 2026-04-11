@@ -14,6 +14,34 @@ The result should be:
 2. **Usable by the user interactively** via slash commands.
 3. **Portable across machines** via a git repo, auto-loaded on startup.
 4. **Published under the user's personal (fobtastic) GitHub account**, not the work (onramplab) account.
+5. **Smart lifecycle cleanup** — ACP bridges touched during a Claude Code session should be closed on session end *only if they are idle* (no active background jobs). Long-running `/acp-submit` jobs must survive session termination so the user can quit and come back.
+
+## Amendment 2026-04-11 — Session lifecycle hooks
+
+After initial implementation, added a session-lifecycle feature to prevent zombie bridge accumulation across Claude Code sessions in different workspaces.
+
+**Motivation:** ACP bridges are persistent singletons keyed on `(backend, workspace)`. Running `/acp-prompt gemini "foo"` in workspace A and then workspace B leaves two gemini-acp-bridge processes alive indefinitely. Over many Claude Code sessions, these accumulate and consume memory.
+
+**Cleanup policy:** Smart — kill idle bridges, preserve busy ones. On `SessionEnd`, for each `(backend, workspace)` tuple this session touched:
+
+1. Query `acp-tool --backend <b> --workspace <w> status`
+2. Parse `activeJobs` from the JSON response
+3. If `activeJobs > 0` → leave the bridge running, log to stderr
+4. If `activeJobs == 0` → close the bridge, log to stderr
+
+`activeJobs` reflects pending + running background jobs submitted via `/acp-submit`. Synchronous `/acp-prompt` calls don't increment it, but they're always complete by the time `SessionEnd` fires (slash commands are synchronous). Background jobs are exactly the "don't kill my long-running work" case.
+
+**Implementation components:**
+
+- `plugins/acp-bridge/hooks/hooks.json` — declares `SessionStart` and `SessionEnd` hooks invoking a shell script.
+- `plugins/acp-bridge/scripts/session-hook.sh` — `start` creates a per-session state file at `~/.cache/claude-acp-bridge/sessions/<session_id>.list` and exports `CLAUDE_ACP_SESSION_FILE` via `$CLAUDE_ENV_FILE` so the plugin's command scripts can see it. `end` reads the state file, applies the smart cleanup policy, removes the file.
+- `plugins/acp-bridge/scripts/acp.sh` — modified to append `<backend>\t<$PWD>` to `$CLAUDE_ACP_SESSION_FILE` (dedup via `grep -qxF`) before each bridge invocation. Only active when the env var is set (i.e., inside a Claude Code session); direct shell invocations don't track.
+
+**Known limitations:**
+
+- **Cross-session interference**: if two Claude Code sessions run in the same workspace and one ends while the other has a sync prompt in flight, the first's cleanup can kill the second's bridge mid-call. Rare; recovery is automatic (retry respawns the bridge).
+- **Session-scope only**: bridges started outside Claude Code (e.g., by the pi-coding-agent extension) aren't tracked, aren't cleaned up. Intentional — we only manage what we touch.
+- **State file leaks on crash**: if Claude Code terminates abnormally without firing `SessionEnd`, the state file is orphaned. Low impact — next `SessionStart` creates a new file, and the orphan is harmless (cleanup on next manual `/acp-close` or a housekeeping sweep could be added later).
 
 ## Non-goals
 
