@@ -39,20 +39,24 @@ is_valid_backend() {
 }
 
 split_backend_and_text() {
-  # Populates BACKEND and TEXT from $1.
+  # Populates BACKEND and TEXT from $1. Splits on any run of whitespace
+  # (space or tab) and trims surrounding whitespace from both halves.
   local raw="$1"
   # Trim leading whitespace.
   raw="${raw#"${raw%%[![:space:]]*}"}"
+  # Trim trailing whitespace.
+  raw="${raw%"${raw##*[![:space:]]}"}"
   if [ -z "$raw" ]; then
     BACKEND=""
     TEXT=""
     return
   fi
-  BACKEND="${raw%% *}"
-  if [ "$BACKEND" = "$raw" ]; then
-    TEXT=""
+  if [[ "$raw" =~ ^([^[:space:]]+)[[:space:]]+(.*)$ ]]; then
+    BACKEND="${BASH_REMATCH[1]}"
+    TEXT="${BASH_REMATCH[2]}"
   else
-    TEXT="${raw#* }"
+    BACKEND="$raw"
+    TEXT=""
   fi
 }
 
