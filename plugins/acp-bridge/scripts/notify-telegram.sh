@@ -46,12 +46,21 @@ if [ -z "$MESSAGE" ]; then
   exit 0
 fi
 
-# Prefix with a recognizable header so users can tell where it came from.
-# Sent as plain text (no parse_mode) because the message body can contain
-# arbitrary characters — job ids with underscores, angle brackets in the
-# "/acp-follow <backend> <job-id>" hint, etc. — that would break Telegram's
-# Markdown/HTML parsers and return HTTP 400.
-FULL_MESSAGE=$(printf 'acp-bridge\n\n%s' "$MESSAGE")
+# HTML-escape the message body so arbitrary characters (job ids with
+# underscores, angle brackets in the "/acp-follow <backend> <job-id>" hint,
+# etc.) don't break Telegram's parser. HTML mode only requires escaping
+# three characters (&, <, >), unlike MarkdownV2 which escapes 18. Then
+# wrap a recognizable <b>acp-bridge</b> header around the body for the
+# bolded app tag users asked for.
+#
+# Important: bash 5.2 enables `patsub_replacement` by default, which makes
+# a bare `&` in the replacement string expand to the matched text. We
+# backslash-escape `&` in the replacement so it stays literal — otherwise
+# `&lt;` would expand to `<lt;` (matched `<` plus literal `lt;`).
+ESCAPED_BODY=${MESSAGE//&/\&amp;}
+ESCAPED_BODY=${ESCAPED_BODY//</\&lt;}
+ESCAPED_BODY=${ESCAPED_BODY//>/\&gt;}
+FULL_MESSAGE=$(printf '<b>acp-bridge</b>\n\n%s' "$ESCAPED_BODY")
 
 # POST to Telegram Bot API. Capture the HTTP status code via -w.
 STATUS_TMP=$(mktemp)
@@ -59,6 +68,7 @@ curl -sS -o /dev/null -w '%{http_code}' \
   "https://api.telegram.org/bot${TOKEN}/sendMessage" \
   --data-urlencode "chat_id=${CHAT_ID}" \
   --data-urlencode "text=${FULL_MESSAGE}" \
+  --data "parse_mode=HTML" \
   > "$STATUS_TMP" 2>/dev/null || true
 
 status=$(cat "$STATUS_TMP" 2>/dev/null || echo "000")
