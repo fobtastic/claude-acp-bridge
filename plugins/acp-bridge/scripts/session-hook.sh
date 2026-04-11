@@ -77,7 +77,9 @@ case "$ACTION" in
       exit 0
     fi
 
-    BIN="${ACP_TOOL_BIN:-$HOME/agent-extensions/acp-tool}"
+    SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+    DEFAULT_BIN="$(dirname "$SCRIPT_DIR")/bin/acp-client"
+    BIN="${ACP_CLIENT_BIN:-$DEFAULT_BIN}"
     if [ ! -x "$BIN" ]; then
       rm -f "$state_file"
       exit 0

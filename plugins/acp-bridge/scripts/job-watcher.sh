@@ -26,7 +26,7 @@
 #
 # Env vars:
 #   ACP_BRIDGE_WATCH_INTERVAL    — seconds between polls (default 30)
-#   ACP_TOOL_BIN                 — override acp-tool path
+#   ACP_CLIENT_BIN               — override bundled acp-client path
 #   ACP_BRIDGE_TELEGRAM_CHAT_ID  — if set, forward notifications via telegram
 #   ACP_BRIDGE_WATCHER_SESSION_ID — explicit session id (bypasses stdin JSON);
 #                                   used by inject-pending.sh when respawning
@@ -34,16 +34,16 @@
 
 set -uo pipefail
 
-BIN="${ACP_TOOL_BIN:-$HOME/agent-extensions/acp-tool}"
+# Derive plugin paths from this script's real location. We intentionally do
+# NOT trust $CLAUDE_PLUGIN_ROOT — it can be polluted by other plugins when
+# the hook subprocess inherits a parent env (observed with the telegram
+# plugin leaking its root into the acp-bridge watcher's env).
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+PLUGIN_ROOT="$(dirname "$SCRIPT_DIR")"
+BIN="${ACP_CLIENT_BIN:-$PLUGIN_ROOT/bin/acp-client}"
 BACKENDS=(gemini qwen codex)
 INTERVAL="${ACP_BRIDGE_WATCH_INTERVAL:-30}"
 STATE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/claude-acp-bridge/sessions"
-# Always derive PLUGIN_ROOT from this script's real path. We intentionally
-# do NOT trust $CLAUDE_PLUGIN_ROOT here: the Claude Code parent process can
-# leak another plugin's root into the hook subprocess environment, which
-# would make $PLUGIN_ROOT/scripts/notify-telegram.sh resolve to a non-
-# existent path and silently skip Telegram dispatch.
-PLUGIN_ROOT="$(dirname "$(dirname "$(readlink -f "$0")")")"
 
 # Resolve session_id: prefer explicit env (respawn path), fall back to stdin
 # JSON (hook spawn path).

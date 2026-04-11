@@ -4,18 +4,25 @@
 #
 # Usage: acp.sh <subcommand> [arguments...]
 #
-# Resolves the ACP tool path from $ACP_TOOL_BIN (default: $HOME/agent-extensions/acp-tool),
-# parses the remaining arguments according to the subcommand's conventions, and invokes
-# the underlying bridge.
+# Resolves the ACP client path from $ACP_CLIENT_BIN, defaulting to the
+# bundled `../bin/acp-client` Python binary that ships with the plugin.
+# Parses the remaining arguments according to the subcommand's conventions
+# and invokes the underlying client.
 
 set -euo pipefail
 
-BIN="${ACP_TOOL_BIN:-$HOME/agent-extensions/acp-tool}"
+# Derive the plugin's bin path from this script's real location so the
+# default works regardless of $CLAUDE_PLUGIN_ROOT (which can be polluted
+# by other plugins when running from hook subprocesses).
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+DEFAULT_BIN="$(dirname "$SCRIPT_DIR")/bin/acp-client"
+BIN="${ACP_CLIENT_BIN:-$DEFAULT_BIN}"
 BACKENDS_ALL=(gemini qwen codex)
 
 if [ ! -x "$BIN" ]; then
-  echo "acp-bridge: tool not found or not executable: $BIN" >&2
-  echo "Set ACP_TOOL_BIN or install to \$HOME/agent-extensions/acp-tool" >&2
+  echo "acp-bridge: client not found or not executable: $BIN" >&2
+  echo "The plugin ships with a bundled client at $DEFAULT_BIN." >&2
+  echo "Override with ACP_CLIENT_BIN if you want a different binary." >&2
   exit 127
 fi
 

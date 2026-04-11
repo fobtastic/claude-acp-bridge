@@ -1,0 +1,1724 @@
+#!/usr/bin/env python3
+"""acp-client — persistent ACP bridge for Gemini, Qwen, and Codex backends.
+
+Keeps an ACP session alive per backend and exposes a small local Unix-socket
+RPC service plus a CLI client that streams responses back in real time.
+Shells out to the external `gemini` / `qwen` / `codex` CLIs — those remain
+prereqs and must be installed and authenticated separately.
+
+Bundled with the `claude-acp-bridge` Claude Code plugin. Normally invoked
+via the plugin's /acp-* slash commands rather than called directly. If you
+do want to call it directly:
+
+  ./acp-client status
+  ./acp-client sessions
+  ./acp-client prompt "Summarize the repo"
+  ./acp-client --backend qwen prompt "Summarize the repo"
+  ./acp-client --backend codex prompt "Summarize the repo"
+  ./acp-client reset
+
+Requires: Python 3.9+ (stdlib only, no third-party packages).
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Optional
+
+DEFAULT_WORKSPACE = Path.cwd()
+DEFAULT_OUTPUT_BYTE_LIMIT = 1_048_576
+SUPPORTED_BACKENDS = ("gemini", "qwen", "codex")
+
+JsonValue = dict[str, Any]
+EventCallback = Callable[[JsonValue], Awaitable[None]]
+
+
+class BridgeError(RuntimeError):
+    pass
+
+
+class JsonRpcError(BridgeError):
+    pass
+
+
+@dataclass(frozen=True)
+class BackendSpec:
+    name: str
+    title: str
+    command: tuple[str, ...]
+    supports_local_discovery: bool = False
+
+
+BACKENDS: dict[str, BackendSpec] = {
+    "gemini": BackendSpec(
+        name="gemini",
+        title="Gemini",
+        command=("gemini", "--acp", "--yolo"),
+        supports_local_discovery=True,
+    ),
+    "qwen": BackendSpec(
+        name="qwen",
+        title="Qwen",
+        command=("qwen", "--acp", "--yolo"),
+        supports_local_discovery=True,
+    ),
+    "codex": BackendSpec(
+        name="codex",
+        title="Codex",
+        command=("npx", "-y", "@zed-industries/codex-acp"),
+        supports_local_discovery=False,
+    ),
+}
+
+
+@dataclass
+class RuntimePaths:
+    socket: Path
+    log: Path
+    state: Path
+    root: Path
+
+
+@dataclass
+class TerminalSession:
+    terminal_id: str
+    session_id: str
+    process: asyncio.subprocess.Process
+    output_limit: int = DEFAULT_OUTPUT_BYTE_LIMIT
+    event_cb: Optional[EventCallback] = None
+    _buffer: str = ""
+    _exit_code: Optional[int] = None
+    _signal_name: Optional[str] = None
+    _done: asyncio.Event = field(default_factory=asyncio.Event)
+    _reader_tasks: list[asyncio.Task] = field(default_factory=list)
+
+    async def start(self) -> None:
+        self._reader_tasks = [
+            asyncio.create_task(self._drain_stream("stdout", self.process.stdout)),
+            asyncio.create_task(self._drain_stream("stderr", self.process.stderr)),
+            asyncio.create_task(self._watch_exit()),
+        ]
+
+    async def _drain_stream(self, stream_name: str, stream: Optional[asyncio.StreamReader]) -> None:
+        if stream is None:
+            return
+        while True:
+            chunk = await stream.read(4096)
+            if not chunk:
+                break
+            text = chunk.decode(errors="replace")
+            self._buffer += text
+            if len(self._buffer) > self.output_limit:
+                self._buffer = self._buffer[-self.output_limit :]
+            if self.event_cb and text:
+                try:
+                    await self.event_cb(
+                        {
+                            "type": "terminal_output",
+                            "terminalId": self.terminal_id,
+                            "sessionId": self.session_id,
+                            "stream": stream_name,
+                            "text": text,
+                        }
+                    )
+                except Exception as exc:
+                    sys.stderr.write(f"[terminal-event-callback-error] {exc}\n")
+                    sys.stderr.flush()
+
+    async def _watch_exit(self) -> None:
+        returncode = await self.process.wait()
+        if returncode is not None and returncode < 0:
+            try:
+                self._signal_name = signal.Signals(-returncode).name
+            except Exception:
+                self._signal_name = str(-returncode)
+            self._exit_code = None
+        else:
+            self._exit_code = returncode
+        self._done.set()
+
+    def snapshot(self) -> dict[str, Any]:
+        exit_status = None
+        if self._exit_code is not None or self._signal_name is not None:
+            exit_status = {
+                "exitCode": self._exit_code,
+                "signal": self._signal_name,
+            }
+        return {
+            "output": self._buffer,
+            "exitStatus": exit_status,
+            "truncated": len(self._buffer) >= self.output_limit,
+        }
+
+    async def wait_for_exit(self) -> dict[str, Any]:
+        await self._done.wait()
+        return {
+            "exitCode": self._exit_code,
+            "signal": self._signal_name,
+        }
+
+    async def kill(self) -> None:
+        if self.process.returncode is None:
+            self.process.kill()
+            await self.process.wait()
+        for task in self._reader_tasks:
+            if not task.done():
+                task.cancel()
+        self._done.set()
+
+    async def release(self) -> None:
+        for task in self._reader_tasks:
+            if not task.done():
+                task.cancel()
+        self._done.set()
+
+
+@dataclass
+class PromptJob:
+    job_id: str
+    backend: str
+    prompt: str
+    workspace_root: str
+    session_mode: Optional[str] = None
+    session_id: Optional[str] = None
+    status: str = "queued"
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+    started_at: Optional[float] = None
+    completed_at: Optional[float] = None
+    result: Optional[dict[str, Any]] = None
+    error: Optional[str] = None
+    task: Optional[asyncio.Task] = None
+    done_event: asyncio.Event = field(default_factory=asyncio.Event)
+    events: list[dict[str, Any]] = field(default_factory=list)
+    next_event_id: int = 0
+
+    def append_event(self, event: dict[str, Any]) -> None:
+        event_copy = dict(event)
+        event_copy["eventId"] = self.next_event_id
+        self.next_event_id += 1
+        self.events.append(event_copy)
+        self.updated_at = time.time()
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "jobId": self.job_id,
+            "backend": self.backend,
+            "status": self.status,
+            "prompt": self.prompt,
+            "workspaceRoot": self.workspace_root,
+            "sessionMode": self.session_mode,
+            "sessionId": self.session_id,
+            "createdAt": self.created_at,
+            "updatedAt": self.updated_at,
+            "startedAt": self.started_at,
+            "completedAt": self.completed_at,
+            "error": self.error,
+            "result": self.result,
+            "eventCount": len(self.events),
+            "done": self.done_event.is_set(),
+        }
+
+    def to_record(self) -> dict[str, Any]:
+        record = self.snapshot()
+        record["events"] = self.events
+        record["nextEventId"] = self.next_event_id
+        return record
+
+    @classmethod
+    def from_record(cls, record: dict[str, Any]) -> "PromptJob":
+        job = cls(
+            job_id=str(record.get("jobId") or ""),
+            backend=str(record.get("backend") or ""),
+            prompt=str(record.get("prompt") or ""),
+            workspace_root=str(record.get("workspaceRoot") or ""),
+            session_mode=record.get("sessionMode"),
+            session_id=record.get("sessionId"),
+            status=str(record.get("status") or "queued"),
+            created_at=float(record.get("createdAt") or time.time()),
+            updated_at=float(record.get("updatedAt") or time.time()),
+            started_at=record.get("startedAt"),
+            completed_at=record.get("completedAt"),
+            result=record.get("result") if isinstance(record.get("result"), dict) or record.get("result") is None else {"value": record.get("result")},
+            error=record.get("error"),
+        )
+        job.events = list(record.get("events") or [])
+        job.next_event_id = int(record.get("nextEventId") or len(job.events))
+        if record.get("done") or job.status in {"completed", "failed", "interrupted"}:
+            job.done_event.set()
+        return job
+
+
+class ACPBridge:
+    def __init__(self, backend: str, workspace_root: Path, runtime_paths: RuntimePaths) -> None:
+        self.spec = get_backend_spec(backend)
+        self.backend = self.spec.name
+        self.workspace_root = workspace_root.resolve()
+        self.runtime_paths = runtime_paths
+        self.process: Optional[asyncio.subprocess.Process] = None
+        self.session_id: Optional[str] = None
+        self._next_id = 0
+        self._pending: dict[Any, asyncio.Future] = {}
+        self._stdout_task: Optional[asyncio.Task] = None
+        self._stderr_task: Optional[asyncio.Task] = None
+        self._prompt_lock = asyncio.Lock()
+        self._terminals: dict[str, TerminalSession] = {}
+        self._active_event_cb: Optional[EventCallback] = None
+        self._session_ready = asyncio.Event()
+        self._initialized = False
+        self._jobs: dict[str, PromptJob] = {}
+
+    async def start(self) -> None:
+        if self.process and self.process.returncode is None and self._initialized:
+            return
+
+        self.workspace_root.mkdir(parents=True, exist_ok=True)
+        ensure_private_runtime_tree(self.runtime_paths.root)
+        ensure_private_runtime_tree(self.runtime_paths.log.parent)
+
+        self.process = await asyncio.create_subprocess_exec(
+            *self.spec.command,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(self.workspace_root),
+        )
+
+        self._stdout_task = asyncio.create_task(self._pump_stdout())
+        self._stderr_task = asyncio.create_task(self._pump_stderr())
+
+        await self._initialize_connection()
+        await self._new_session()
+
+    async def request(self, method: str, params: dict[str, Any]) -> Any:
+        if not self.process or not self.process.stdin:
+            raise BridgeError(f"{self.spec.title} ACP process is not running")
+
+        request_id = self._next_request_id()
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._pending[request_id] = future
+
+        payload = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
+        await self._write_json(payload)
+        try:
+            return await future
+        finally:
+            if not future.done():
+                self._pending.pop(request_id, None)
+
+    async def prompt(
+        self,
+        text: str,
+        event_cb: Optional[EventCallback] = None,
+        *,
+        session_mode: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        await self.start()
+        await self.switch_session(session_mode=session_mode, session_id=session_id)
+        if not self.session_id:
+            await self._new_session()
+        if not self.session_id:
+            raise BridgeError(f"{self.spec.title} session is not ready")
+
+        async with self._prompt_lock:
+            self._active_event_cb = event_cb
+            try:
+                result = await self.request(
+                    "session/prompt",
+                    {
+                        "sessionId": self.session_id,
+                        "prompt": [{"type": "text", "text": text}],
+                    },
+                )
+                if event_cb:
+                    await event_cb({"type": "done", "result": result})
+                return result
+            finally:
+                self._active_event_cb = None
+
+    async def reset(self) -> None:
+        await self.shutdown()
+        self._initialized = False
+        self.session_id = None
+        self._session_ready.clear()
+
+    async def close_session(self, delete_state: bool = True) -> None:
+        await self._close_current_session()
+        self.session_id = None
+        self._session_ready.clear()
+        if delete_state:
+            try:
+                self.runtime_paths.state.unlink()
+            except FileNotFoundError:
+                pass
+
+    async def shutdown(self) -> None:
+        for terminal in list(self._terminals.values()):
+            try:
+                await terminal.release()
+            except Exception:
+                pass
+        self._terminals.clear()
+
+        await self.close_session(delete_state=True)
+
+        if self.process and self.process.returncode is None:
+            self.process.terminate()
+            try:
+                await asyncio.wait_for(self.process.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                self.process.kill()
+                await self.process.wait()
+
+        for task in (self._stdout_task, self._stderr_task):
+            if task and not task.done():
+                task.cancel()
+
+        self.process = None
+
+    async def list_sessions(self, cursor: Optional[str] = None) -> dict[str, Any]:
+        remote_error: Optional[Exception] = None
+        try:
+            await self.start()
+            params: dict[str, Any] = {}
+            if cursor:
+                params["cursor"] = cursor
+            result = await asyncio.wait_for(self.request("session/list", params), timeout=20)
+            if isinstance(result, dict):
+                sessions = result.get("sessions") or []
+                return {
+                    "sessions": normalize_remote_sessions(sessions),
+                    "nextCursor": result.get("nextCursor"),
+                }
+        except Exception as exc:
+            remote_error = exc
+
+        sessions = discover_local_sessions(self.backend, self.workspace_root)
+        if sessions:
+            return {"sessions": sessions, "nextCursor": None}
+
+        if remote_error:
+            raise remote_error
+        return {"sessions": [], "nextCursor": None}
+
+    async def new_session(self) -> dict[str, Any]:
+        await self.start()
+        return await self._new_session()
+
+    async def load_session(self, session_id: str) -> dict[str, Any]:
+        await self.start()
+        return await self._load_session(session_id)
+
+    async def switch_session(self, session_mode: Optional[str] = None, session_id: Optional[str] = None) -> None:
+        if session_mode in (None, "current", "existing") and not session_id:
+            return
+
+        if session_mode == "new":
+            await self._new_session()
+            return
+
+        if session_mode == "latest":
+            await self._load_latest_session_or_new()
+            return
+
+        if session_mode == "current" and session_id:
+            await self._load_session(session_id)
+            return
+
+        if session_id:
+            await self._load_session(session_id)
+            return
+
+        if session_mode is not None:
+            raise BridgeError(f"Unsupported session mode: {session_mode}")
+
+    async def _new_session(self) -> dict[str, Any]:
+        result = await asyncio.wait_for(
+            self.request(
+                "session/new",
+                {
+                    "cwd": str(self.workspace_root),
+                    "mcpServers": [],
+                },
+            ),
+            timeout=30,
+        )
+        session_id = result.get("sessionId") if isinstance(result, dict) else None
+        if not session_id:
+            raise BridgeError(f"{self.spec.title} session/new did not return a sessionId")
+        self._set_active_session(str(session_id))
+        return result
+
+    async def _load_session(self, session_id: str) -> dict[str, Any]:
+        await self._close_current_session()
+        result = await asyncio.wait_for(
+            self.request(
+                "session/load",
+                {
+                    "sessionId": str(session_id),
+                    "cwd": str(self.workspace_root),
+                    "mcpServers": [],
+                },
+            ),
+            timeout=30,
+        )
+        self._set_active_session(str(session_id))
+        return result
+
+    async def _load_latest_session_or_new(self) -> None:
+        sessions_result = await self.list_sessions()
+        sessions = sessions_result.get("sessions") or []
+        if not sessions:
+            await self._new_session()
+            return
+        latest = sessions[0]
+        latest_session_id = latest.get("sessionId")
+        if not latest_session_id:
+            await self._new_session()
+            return
+        await self._load_session(str(latest_session_id))
+
+    async def _close_current_session(self) -> None:
+        if not self.session_id or not self.process or self.process.returncode is not None:
+            return
+        try:
+            await asyncio.wait_for(self.request("session/close", {"sessionId": self.session_id}), timeout=15)
+        except Exception:
+            pass
+
+    async def _initialize_connection(self) -> dict[str, Any]:
+        init_result = await asyncio.wait_for(
+            self.request(
+                "initialize",
+                {
+                    "protocolVersion": 1,
+                    "clientCapabilities": {
+                        "auth": {"terminal": False},
+                        "fs": {"readTextFile": True, "writeTextFile": True},
+                        "terminal": True,
+                    },
+                    "clientInfo": {
+                        "name": f"agent-bridge-{self.backend}",
+                        "title": f"Agent Bridge ({self.spec.title})",
+                        "version": "1.0.0",
+                    },
+                    "workspaceRoot": str(self.workspace_root),
+                },
+            ),
+            timeout=30,
+        )
+
+        if not isinstance(init_result, dict):
+            raise BridgeError(f"{self.spec.title} initialize did not return an object")
+        return init_result
+
+    async def _pump_stdout(self) -> None:
+        assert self.process and self.process.stdout and self.process.stdin
+        buffer = bytearray()
+        while True:
+            chunk = await self.process.stdout.read(1)
+            if not chunk:
+                if buffer:
+                    await self._handle_line(buffer.decode(errors="replace"))
+                self._fail_pending_requests(f"{self.spec.title} ACP stdout closed")
+                return
+            if chunk == b"\n":
+                line = buffer.decode(errors="replace")
+                buffer.clear()
+                if line.strip():
+                    await self._handle_line(line)
+            else:
+                buffer.extend(chunk)
+
+    async def _pump_stderr(self) -> None:
+        assert self.process and self.process.stderr
+        ensure_private_runtime_tree(self.runtime_paths.log.parent)
+        with self.runtime_paths.log.open("a", encoding="utf-8") as log:
+            ensure_private_file(self.runtime_paths.log)
+            while True:
+                chunk = await self.process.stderr.read(4096)
+                if not chunk:
+                    return
+                text = chunk.decode(errors="replace")
+                log.write(text)
+                log.flush()
+                sys.stderr.write(text)
+                sys.stderr.flush()
+
+    async def _handle_line(self, raw_line: str) -> None:
+        line = raw_line.strip()
+        if not line:
+            return
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            self._append_log(f"[{self.backend}-nonjson] {line}\n")
+            return
+
+        if isinstance(msg, dict) and "method" in msg:
+            if msg.get("method") == "session/update":
+                await self._handle_session_update(msg)
+                return
+            if "id" in msg:
+                await self._handle_agent_request(msg)
+                return
+
+        if isinstance(msg, dict) and "id" in msg:
+            request_id = msg["id"]
+            future = self._pending.pop(request_id, None)
+            if future and not future.done():
+                if "error" in msg:
+                    future.set_exception(JsonRpcError(json.dumps(msg["error"])))
+                else:
+                    future.set_result(msg.get("result"))
+                return
+
+        self._append_log(f"[{self.backend}-json] {line}\n")
+
+    async def _handle_session_update(self, msg: dict[str, Any]) -> None:
+        update = msg.get("params", {}).get("update", {})
+        if not isinstance(update, dict):
+            return
+
+        kind = update.get("sessionUpdate")
+        event: dict[str, Any] = {"type": "event", "kind": kind, "data": update}
+
+        if kind in {"agent_message_chunk", "agent_thought_chunk", "user_message_chunk", "assistant_message_chunk"}:
+            text = self._extract_text(update.get("content"))
+            if text:
+                event = {"type": "chunk", "kind": kind, "text": text}
+        elif kind == "tool_call":
+            event = {
+                "type": "tool_call",
+                "toolCallId": update.get("toolCallId"),
+                "title": update.get("title"),
+                "rawInput": update.get("rawInput"),
+                "kind": update.get("kind"),
+            }
+        elif kind == "tool_call_update":
+            event = {
+                "type": "tool_update",
+                "toolCallId": update.get("toolCallId"),
+                "title": update.get("title"),
+                "status": update.get("status"),
+                "rawOutput": update.get("rawOutput"),
+                "kind": update.get("kind"),
+            }
+        elif kind == "usage_update":
+            event = {"type": "usage", "data": update}
+
+        try:
+            await self._emit(event)
+        except Exception:
+            pass
+
+    async def _handle_agent_request(self, msg: dict[str, Any]) -> None:
+        request_id = msg.get("id")
+        method = msg.get("method")
+        params = msg.get("params") or {}
+        try:
+            result = await self._dispatch_client_request(method, params)
+            await self._send_response(request_id, result)
+        except Exception as exc:
+            await self._send_error(request_id, str(exc))
+
+    async def _dispatch_client_request(self, method: str, params: dict[str, Any]) -> Any:
+        if method == "fs/read_text_file":
+            return await self._handle_fs_read(params)
+        if method == "fs/write_text_file":
+            return await self._handle_fs_write(params)
+        if method == "session/request_permission":
+            return await self._handle_permission_request(params)
+        if method == "terminal/create":
+            return await self._handle_terminal_create(params)
+        if method == "terminal/output":
+            return await self._handle_terminal_output(params)
+        if method == "terminal/wait_for_exit":
+            return await self._handle_terminal_wait_for_exit(params)
+        if method == "terminal/kill":
+            return await self._handle_terminal_kill(params)
+        if method == "terminal/release":
+            return await self._handle_terminal_release(params)
+        if method in {"authenticate", "session/close"}:
+            return {}
+        raise BridgeError(f"Unsupported ACP client request: {method}")
+
+    async def _handle_fs_read(self, params: dict[str, Any]) -> dict[str, Any]:
+        path = self._resolve_path(params.get("path"))
+        line = params.get("line")
+        limit = params.get("limit")
+        if not path.exists():
+            raise BridgeError(f"File not found: {path}")
+        text = path.read_text(encoding="utf-8", errors="replace")
+        if line is not None or limit is not None:
+            lines = text.splitlines()
+            start = max(int(line or 1) - 1, 0)
+            end = start + int(limit) if limit is not None else None
+            text = "\n".join(lines[start:end])
+        return {"content": text}
+
+    async def _handle_fs_write(self, params: dict[str, Any]) -> dict[str, Any]:
+        path = self._resolve_path(params.get("path"))
+        content = params.get("content", "")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(content), encoding="utf-8")
+        return {}
+
+    async def _handle_permission_request(self, params: dict[str, Any]) -> dict[str, Any]:
+        options = params.get("options") or []
+        selected = None
+        for option in options:
+            if option.get("kind") in {"allow_always", "allow_once"}:
+                selected = option
+                break
+        if selected is None and options:
+            selected = options[0]
+        if not selected:
+            return {"outcome": {"outcome": "cancelled"}}
+        return {"outcome": {"outcome": "selected", "optionId": selected.get("optionId")}}
+
+    async def _handle_terminal_create(self, params: dict[str, Any]) -> dict[str, Any]:
+        command = params.get("command")
+        if not command:
+            raise BridgeError("terminal/create is missing command")
+        args = params.get("args") or []
+        cwd = self._resolve_path(params.get("cwd") or str(self.workspace_root))
+        output_limit = int(params.get("outputByteLimit") or DEFAULT_OUTPUT_BYTE_LIMIT)
+        env = os.environ.copy()
+        for item in params.get("env") or []:
+            name = item.get("name")
+            value = item.get("value")
+            if name:
+                env[str(name)] = str(value)
+
+        proc = await asyncio.create_subprocess_exec(
+            str(command),
+            *[str(arg) for arg in args],
+            cwd=str(cwd),
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        terminal_id = f"term_{uuid.uuid4().hex[:12]}"
+        terminal = TerminalSession(
+            terminal_id=terminal_id,
+            session_id=self.session_id or "",
+            process=proc,
+            output_limit=output_limit,
+            event_cb=self._active_event_cb,
+        )
+        self._terminals[terminal_id] = terminal
+        await terminal.start()
+        return {"terminalId": terminal_id}
+
+    async def _handle_terminal_output(self, params: dict[str, Any]) -> dict[str, Any]:
+        terminal = self._get_terminal(params.get("terminalId"))
+        snapshot = terminal.snapshot()
+        return {
+            "output": snapshot["output"],
+            "exitStatus": snapshot["exitStatus"],
+            "truncated": snapshot["truncated"],
+        }
+
+    async def _handle_terminal_wait_for_exit(self, params: dict[str, Any]) -> dict[str, Any]:
+        terminal = self._get_terminal(params.get("terminalId"))
+        return await terminal.wait_for_exit()
+
+    async def _handle_terminal_kill(self, params: dict[str, Any]) -> dict[str, Any]:
+        terminal = self._get_terminal(params.get("terminalId"))
+        await terminal.kill()
+        return {}
+
+    async def _handle_terminal_release(self, params: dict[str, Any]) -> dict[str, Any]:
+        terminal_id = params.get("terminalId")
+        terminal = self._terminals.pop(terminal_id, None)
+        if terminal:
+            await terminal.release()
+        return {}
+
+    def _get_terminal(self, terminal_id: Any) -> TerminalSession:
+        if not terminal_id:
+            raise BridgeError("terminal request missing terminalId")
+        terminal = self._terminals.get(str(terminal_id))
+        if not terminal:
+            raise BridgeError(f"Unknown terminal: {terminal_id}")
+        return terminal
+
+    async def _send_response(self, request_id: Any, result: Any) -> None:
+        await self._write_json({"jsonrpc": "2.0", "id": request_id, "result": result})
+
+    async def _send_error(self, request_id: Any, message: str) -> None:
+        await self._write_json({"jsonrpc": "2.0", "id": request_id, "error": {"code": -32000, "message": message}})
+
+    async def _write_json(self, payload: dict[str, Any]) -> None:
+        if not self.process or not self.process.stdin:
+            raise BridgeError(f"{self.spec.title} ACP process is not running")
+        data = (json.dumps(payload, ensure_ascii=False) + "\n").encode()
+        self.process.stdin.write(data)
+        await self.process.stdin.drain()
+
+    async def _emit(self, event: dict[str, Any]) -> None:
+        if self._active_event_cb:
+            await self._active_event_cb(event)
+
+    def _save_persisted_state(self) -> None:
+        if not self.session_id:
+            return
+        ensure_private_runtime_tree(self.runtime_paths.state.parent)
+        payload = {
+            "backend": self.backend,
+            "sessionId": self.session_id,
+            "workspaceRoot": str(self.workspace_root),
+        }
+        tmp_path = self.runtime_paths.state.with_suffix(".json.tmp")
+        tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        ensure_private_file(tmp_path)
+        tmp_path.replace(self.runtime_paths.state)
+        ensure_private_file(self.runtime_paths.state)
+
+    def _set_active_session(self, session_id: str) -> None:
+        self.session_id = session_id
+        self._initialized = True
+        self._session_ready.set()
+        self._save_persisted_state()
+
+    def _next_request_id(self) -> int:
+        self._next_id += 1
+        return self._next_id
+
+    def _fail_pending_requests(self, message: str) -> None:
+        for request_id, future in list(self._pending.items()):
+            if not future.done():
+                future.set_exception(BridgeError(message))
+            self._pending.pop(request_id, None)
+
+    def _resolve_path(self, raw_path: Any) -> Path:
+        if raw_path is None:
+            raise BridgeError("Path is required")
+        path = Path(str(raw_path))
+        if not path.is_absolute():
+            path = self.workspace_root / path
+        resolved = path.resolve()
+        try:
+            resolved.relative_to(self.workspace_root)
+        except ValueError as exc:
+            raise BridgeError(f"Path escapes workspace root: {resolved}") from exc
+        return resolved
+
+    def _extract_text(self, content: Any) -> str:
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, dict):
+            if content.get("type") == "text":
+                return str(content.get("text", ""))
+            if "text" in content:
+                return str(content.get("text", ""))
+        if isinstance(content, list):
+            return "".join(self._extract_text(item) for item in content)
+        return str(content)
+
+    def _append_log(self, text: str) -> None:
+        ensure_private_runtime_tree(self.runtime_paths.log.parent)
+        with self.runtime_paths.log.open("a", encoding="utf-8") as log:
+            ensure_private_file(self.runtime_paths.log)
+            log.write(text)
+
+
+def get_backend_spec(name: str) -> BackendSpec:
+    try:
+        return BACKENDS[name]
+    except KeyError as exc:
+        raise BridgeError(f"Unsupported backend: {name}") from exc
+
+
+def get_runtime_paths(backend: str) -> RuntimePaths:
+    root = Path.home() / ".cache" / "remote-hunter" / "acp-bridge" / backend
+    return RuntimePaths(
+        socket=root / f"{backend}.sock",
+        log=root / "bridge.log",
+        state=root / "state.json",
+        root=root,
+    )
+
+
+def get_jobs_dir(runtime_paths: RuntimePaths) -> Path:
+    return runtime_paths.root / "jobs"
+
+
+def get_job_path(runtime_paths: RuntimePaths, job_id: str) -> Path:
+    return get_jobs_dir(runtime_paths) / f"{job_id}.json"
+
+
+def save_job(runtime_paths: RuntimePaths, job: PromptJob) -> None:
+    jobs_dir = get_jobs_dir(runtime_paths)
+    ensure_private_runtime_tree(jobs_dir)
+    path = get_job_path(runtime_paths, job.job_id)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(job.to_record(), indent=2, sort_keys=True), encoding="utf-8")
+    ensure_private_file(tmp)
+    tmp.replace(path)
+    ensure_private_file(path)
+
+
+def load_jobs(runtime_paths: RuntimePaths) -> dict[str, PromptJob]:
+    jobs_dir = get_jobs_dir(runtime_paths)
+    if not jobs_dir.exists():
+        return {}
+    jobs: dict[str, PromptJob] = {}
+    for path in jobs_dir.glob("*.json"):
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(record, dict):
+                continue
+            job = PromptJob.from_record(record)
+            if not job.job_id:
+                continue
+            if job.status in {"queued", "running"}:
+                job.status = "interrupted"
+                job.error = job.error or "Bridge restarted before job completion"
+                job.completed_at = time.time()
+                job.done_event.set()
+            jobs[job.job_id] = job
+        except Exception:
+            continue
+    return jobs
+
+
+def ensure_private_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(path, 0o700)
+    except PermissionError:
+        pass
+
+
+def ensure_private_runtime_tree(path: Path) -> None:
+    ensure_private_dir(path.parent)
+    ensure_private_dir(path)
+
+
+def ensure_private_file(path: Path) -> None:
+    try:
+        os.chmod(path, 0o600)
+    except FileNotFoundError:
+        pass
+    except PermissionError:
+        pass
+
+
+def qwen_project_slug(workspace_root: Path) -> str:
+    return str(workspace_root.resolve()).replace("/", "-")
+
+
+def discover_local_sessions(backend: str, workspace_root: Path) -> list[dict[str, Any]]:
+    if backend == "gemini":
+        return discover_gemini_sessions(workspace_root)
+    if backend == "qwen":
+        return discover_qwen_sessions(workspace_root)
+    return []
+
+
+def discover_gemini_sessions(workspace_root: Path) -> list[dict[str, Any]]:
+    sessions_dir = Path.home() / ".gemini" / "tmp" / workspace_root.name / "chats"
+    if not sessions_dir.exists():
+        return []
+
+    sessions: list[dict[str, Any]] = []
+    for path in sessions_dir.glob("session-*.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                continue
+            messages = data.get("messages") or []
+            title = data.get("title") or extract_gemini_session_title(messages)
+            sessions.append(
+                {
+                    "sessionId": data.get("sessionId") or path.stem.replace("session-", ""),
+                    "updatedAt": data.get("lastUpdated") or data.get("startTime") or path.stat().st_mtime,
+                    "title": title or "",
+                    "path": str(path),
+                }
+            )
+        except Exception:
+            continue
+    return sorted(sessions, key=sort_session_key, reverse=True)
+
+
+def discover_qwen_sessions(workspace_root: Path) -> list[dict[str, Any]]:
+    sessions_dir = Path.home() / ".qwen" / "projects" / qwen_project_slug(workspace_root) / "chats"
+    if not sessions_dir.exists():
+        return []
+
+    sessions: list[dict[str, Any]] = []
+    for path in sessions_dir.glob("*.jsonl"):
+        try:
+            session_id = path.stem
+            title = ""
+            updated_at: Any = path.stat().st_mtime
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
+                for raw_line in handle:
+                    raw_line = raw_line.strip()
+                    if not raw_line:
+                        continue
+                    item = json.loads(raw_line)
+                    if not isinstance(item, dict):
+                        continue
+                    session_id = str(item.get("sessionId") or session_id)
+                    updated_at = item.get("timestamp") or updated_at
+                    if not title and item.get("type") == "user":
+                        parts = item.get("message", {}).get("parts") or []
+                        title = extract_parts_text(parts)[:80]
+            sessions.append(
+                {
+                    "sessionId": session_id,
+                    "updatedAt": updated_at,
+                    "title": title,
+                    "path": str(path),
+                }
+            )
+        except Exception:
+            continue
+    return sorted(sessions, key=sort_session_key, reverse=True)
+
+
+def normalize_remote_sessions(sessions: list[Any]) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for item in sessions:
+        if not isinstance(item, dict):
+            continue
+        normalized.append(
+            {
+                "sessionId": item.get("sessionId") or item.get("id") or item.get("threadId"),
+                "updatedAt": item.get("updatedAt") or item.get("lastUpdated") or item.get("createdAt") or "",
+                "title": item.get("title") or item.get("summary") or item.get("name") or "",
+            }
+        )
+    return sorted([s for s in normalized if s.get("sessionId")], key=sort_session_key, reverse=True)
+
+
+def sort_session_key(item: dict[str, Any]) -> str:
+    return str(item.get("updatedAt") or "")
+
+
+def extract_parts_text(parts: Any) -> str:
+    if not isinstance(parts, list):
+        return ""
+    chunks: list[str] = []
+    for part in parts:
+        if isinstance(part, dict):
+            text = part.get("text")
+            if text:
+                chunks.append(str(text))
+    return " ".join(chunks).strip()
+
+
+def extract_gemini_session_title(messages: Any) -> str:
+    if not isinstance(messages, list):
+        return ""
+    for message in messages:
+        if not isinstance(message, dict) or message.get("type") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, list):
+            title = extract_parts_text(content)
+            if title:
+                return title[:80]
+        if isinstance(content, str) and content.strip():
+            return content.strip()[:80]
+    return ""
+
+
+def format_sessions_table(sessions: list[dict[str, Any]]) -> str:
+    if not sessions:
+        return "No sessions found."
+    lines = ["IDX  SESSION ID                             UPDATED AT                TITLE"]
+    for idx, session in enumerate(sessions, start=1):
+        session_id = str(session.get("sessionId") or "-")
+        updated_at = str(session.get("updatedAt") or "-")[:24]
+        title = str(session.get("title") or "")
+        lines.append(f"{idx:<4} {session_id:<36} {updated_at:<24} {title}")
+    return "\n".join(lines)
+
+
+def pick_session_interactively(sessions: list[dict[str, Any]]) -> Optional[str]:
+    if not sessions:
+        return None
+    if not sys.stdin.isatty():
+        return str(sessions[0].get("sessionId"))
+    print(format_sessions_table(sessions))
+    while True:
+        choice = input("Select session number (Enter for latest, q to cancel): ").strip().lower()
+        if choice in {"", "1"}:
+            return str(sessions[0].get("sessionId"))
+        if choice in {"q", "quit", "cancel"}:
+            return None
+        if choice.isdigit():
+            idx = int(choice) - 1
+            if 0 <= idx < len(sessions):
+                return str(sessions[idx].get("sessionId"))
+        print("Invalid selection.")
+
+
+async def wait_for_socket(socket_path: Path, timeout: float = 10.0) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        if socket_path.exists():
+            try:
+                reader, writer = await asyncio.open_unix_connection(str(socket_path))
+                writer.close()
+                await writer.wait_closed()
+                return
+            except Exception:
+                pass
+        await asyncio.sleep(0.25)
+    raise TimeoutError(f"Timed out waiting for {socket_path}")
+
+
+def start_server_process(script_path: Path, backend: str, socket_path: Path, workspace_root: Path) -> subprocess.Popen:
+    runtime_paths = get_runtime_paths(backend)
+    ensure_private_runtime_tree(socket_path.parent)
+    ensure_private_runtime_tree(runtime_paths.log.parent)
+    log_file = runtime_paths.log.open("a", encoding="utf-8")
+    return subprocess.Popen(
+        [
+            sys.executable,
+            str(script_path),
+            "serve",
+            "--backend",
+            backend,
+            "--socket",
+            str(socket_path),
+            "--workspace",
+            str(workspace_root),
+        ],
+        stdout=log_file,
+        stderr=log_file,
+        start_new_session=True,
+        cwd=str(workspace_root),
+    )
+
+
+async def connect_client(socket_path: Path) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    return await asyncio.open_unix_connection(str(socket_path))
+
+
+async def _send_socket_request(socket_path: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    reader, writer = await connect_client(socket_path)
+    try:
+        writer.write((json.dumps(payload) + "\n").encode())
+        await writer.drain()
+        while True:
+            line = await reader.readline()
+            if not line:
+                raise BridgeError("Bridge closed the connection unexpectedly")
+            try:
+                event = json.loads(line.decode(errors="replace"))
+            except json.JSONDecodeError:
+                continue
+            if event.get("type") == "done":
+                return event.get("result") or {}
+            if event.get("type") == "error":
+                raise BridgeError(str(event.get("message", "Unknown bridge error")))
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
+def notify_job_completion(job: PromptJob) -> None:
+    title = f"ACP {job.backend} job complete"
+    body = job.prompt[:120]
+    if shutil.which("notify-send"):
+        try:
+            subprocess.Popen(["notify-send", title, body], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+
+async def prompt_via_socket(
+    socket_path: Path,
+    prompt: str,
+    *,
+    plain: bool = True,
+    workspace_root: Optional[Path] = None,
+    session_mode: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> int:
+    reader, writer = await connect_client(socket_path)
+    try:
+        payload: dict[str, Any] = {"action": "prompt", "prompt": prompt}
+        if workspace_root is not None:
+            payload["workspaceRoot"] = str(workspace_root)
+        if session_mode is not None:
+            payload["sessionMode"] = session_mode
+        if session_id is not None:
+            payload["sessionId"] = session_id
+        writer.write((json.dumps(payload) + "\n").encode())
+        await writer.drain()
+
+        while True:
+            line = await reader.readline()
+            if not line:
+                break
+            try:
+                event = json.loads(line.decode(errors="replace"))
+            except json.JSONDecodeError:
+                print(line.decode(errors="replace"), end="")
+                continue
+
+            kind = event.get("type")
+            if kind == "chunk":
+                text = event.get("text", "")
+                if plain:
+                    print(text, end="", flush=True)
+                else:
+                    print(json.dumps(event, ensure_ascii=False))
+            elif kind == "tool_call":
+                print(f"\n[tool] {event.get('title') or event.get('toolCallId')}", file=sys.stderr)
+            elif kind == "tool_update":
+                print(f"\n[tool:{event.get('status')}] {event.get('title') or event.get('toolCallId')}", file=sys.stderr)
+            elif kind == "usage":
+                print(f"\n[usage] {json.dumps(event.get('data'), ensure_ascii=False)}", file=sys.stderr)
+            elif kind == "terminal_output":
+                stream_name = event.get("stream", "terminal")
+                text = event.get("text", "")
+                print(f"\n[terminal:{stream_name}] {text}", end="", file=sys.stderr, flush=True)
+            elif kind == "event":
+                print(f"\n[event] {json.dumps(event.get('data'), ensure_ascii=False)}", file=sys.stderr)
+            elif kind == "done":
+                if not plain:
+                    print(json.dumps(event, ensure_ascii=False))
+                return 0
+            elif kind == "error":
+                print(event.get("message", "Unknown bridge error"), file=sys.stderr)
+                return 1
+        return 0
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
+async def run_server(backend: str, socket_path: Path, workspace_root: Path) -> None:
+    runtime_paths = get_runtime_paths(backend)
+    if socket_path.exists():
+        socket_path.unlink()
+    ensure_private_runtime_tree(socket_path.parent)
+
+    bridge = ACPBridge(backend, workspace_root, runtime_paths)
+    jobs: dict[str, PromptJob] = load_jobs(runtime_paths)
+    stop_event = asyncio.Event()
+
+    async def append_job_event(job: PromptJob, event: JsonValue) -> None:
+        job.append_event(event)
+        if event.get("type") == "done":
+            job.status = "completed"
+            job.result = event.get("result") if isinstance(event.get("result"), dict) else {"value": event.get("result")}
+            job.completed_at = time.time()
+            job.done_event.set()
+            notify_job_completion(job)
+        elif event.get("type") == "error":
+            job.status = "failed"
+            job.error = str(event.get("message", "Unknown bridge error"))
+            job.completed_at = time.time()
+            job.done_event.set()
+            notify_job_completion(job)
+        save_job(runtime_paths, job)
+
+    async def execute_job(job: PromptJob) -> None:
+        job.status = "running"
+        job.started_at = time.time()
+        job.updated_at = time.time()
+        save_job(runtime_paths, job)
+
+        async def record(event: JsonValue) -> None:
+            await append_job_event(job, event)
+
+        try:
+            await bridge.prompt(job.prompt, event_cb=record, session_mode=job.session_mode, session_id=job.session_id)
+            if not job.done_event.is_set():
+                job.status = "completed"
+                job.completed_at = time.time()
+                job.done_event.set()
+                notify_job_completion(job)
+                save_job(runtime_paths, job)
+        except Exception as exc:
+            await append_job_event(job, {"type": "error", "message": str(exc)})
+
+    async def handle_connection(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        async def emit(event: JsonValue) -> None:
+            writer.write((json.dumps(event, ensure_ascii=False) + "\n").encode())
+            await writer.drain()
+
+        try:
+            line = await reader.readline()
+            if not line:
+                return
+            request = json.loads(line.decode(errors="replace"))
+            action = request.get("action", "prompt")
+            if request.get("workspaceRoot"):
+                bridge.workspace_root = Path(request["workspaceRoot"]).resolve()
+
+            if action == "reset":
+                await bridge.reset()
+                await emit({"type": "done", "result": {"reset": True}})
+                return
+
+            if action == "close":
+                await bridge.shutdown()
+                await emit({"type": "done", "result": {"closed": True}})
+                stop_event.set()
+                return
+
+            if action == "status":
+                await emit(
+                    {
+                        "type": "done",
+                        "result": {
+                            "running": True,
+                            "backend": bridge.backend,
+                            "sessionId": bridge.session_id,
+                            "workspaceRoot": str(bridge.workspace_root),
+                            "activeJobs": len([job for job in jobs.values() if not job.done_event.is_set()]),
+                        },
+                    }
+                )
+                return
+
+            if action == "list_sessions":
+                result = await bridge.list_sessions(request.get("cursor"))
+                await emit({"type": "done", "result": result})
+                return
+
+            if action == "new_session":
+                result = await bridge.new_session()
+                await emit({"type": "done", "result": result})
+                return
+
+            if action == "list_jobs":
+                job_items = sorted((job.snapshot() for job in jobs.values()), key=lambda item: item.get("createdAt", 0), reverse=True)
+                await emit({"type": "done", "result": {"jobs": job_items}})
+                return
+
+            if action == "job_status":
+                job_id = str(request.get("jobId") or "")
+                job = jobs.get(job_id)
+                if not job:
+                    await emit({"type": "error", "message": f"Unknown job: {job_id}"})
+                    return
+                await emit({"type": "done", "result": job.snapshot()})
+                return
+
+            if action == "job_events":
+                job_id = str(request.get("jobId") or "")
+                job = jobs.get(job_id)
+                if not job:
+                    await emit({"type": "error", "message": f"Unknown job: {job_id}"})
+                    return
+                offset = int(request.get("offset") or 0)
+                await emit({"type": "done", "result": {"events": job.events[offset:], "nextOffset": len(job.events), "done": job.done_event.is_set(), "status": job.status}})
+                return
+
+            if action == "submit_prompt":
+                prompt = request.get("prompt")
+                if not prompt:
+                    await emit({"type": "error", "message": "Missing prompt"})
+                    return
+                session_mode = request.get("sessionMode")
+                session_id = request.get("sessionId")
+                if session_mode == "pick" and not session_id:
+                    sessions_result = await bridge.list_sessions()
+                    session_id = pick_session_interactively(sessions_result.get("sessions") or [])
+                    if not session_id:
+                        await emit({"type": "done", "result": {"cancelled": True}})
+                        return
+                    session_mode = None
+                job = PromptJob(
+                    job_id=f"job_{uuid.uuid4().hex[:12]}",
+                    backend=bridge.backend,
+                    prompt=str(prompt),
+                    workspace_root=str(bridge.workspace_root),
+                    session_mode=session_mode,
+                    session_id=session_id,
+                )
+                jobs[job.job_id] = job
+                save_job(runtime_paths, job)
+                job.task = asyncio.create_task(execute_job(job))
+                await emit({"type": "done", "result": {"submitted": True, "jobId": job.job_id, "status": job.status}})
+                return
+
+            prompt = request.get("prompt")
+            if not prompt:
+                await emit({"type": "error", "message": "Missing prompt"})
+                return
+            session_mode = request.get("sessionMode")
+            session_id = request.get("sessionId")
+            if session_mode == "pick" and not session_id:
+                sessions_result = await bridge.list_sessions()
+                session_id = pick_session_interactively(sessions_result.get("sessions") or [])
+                if not session_id:
+                    await emit({"type": "done", "result": {"cancelled": True}})
+                    return
+                session_mode = None
+            await bridge.prompt(str(prompt), event_cb=emit, session_mode=session_mode, session_id=session_id)
+        except Exception as exc:
+            try:
+                await emit({"type": "error", "message": str(exc)})
+            except Exception:
+                pass
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    server = await asyncio.start_unix_server(handle_connection, path=str(socket_path))
+    ensure_private_file(socket_path)
+    loop = asyncio.get_running_loop()
+
+    def request_stop() -> None:
+        stop_event.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, request_stop)
+        except NotImplementedError:
+            pass
+
+    serve_task = asyncio.create_task(server.serve_forever())
+    try:
+        await stop_event.wait()
+    finally:
+        server.close()
+        serve_task.cancel()
+        try:
+            await server.wait_closed()
+        except Exception:
+            pass
+        try:
+            await serve_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+        await bridge.shutdown()
+        if socket_path.exists():
+            socket_path.unlink()
+
+
+async def ensure_server(backend: str, socket_path: Path, workspace_root: Path) -> None:
+    if socket_path.exists():
+        try:
+            reader, writer = await asyncio.open_unix_connection(str(socket_path))
+            writer.close()
+            await writer.wait_closed()
+            return
+        except Exception:
+            try:
+                socket_path.unlink()
+            except FileNotFoundError:
+                pass
+
+    await asyncio.to_thread(start_server_process, Path(__file__).resolve(), backend, socket_path, workspace_root)
+    await wait_for_socket(socket_path)
+
+
+async def fetch_sessions(backend: str, socket_path: Path, workspace_root: Path, cursor: Optional[str] = None) -> dict[str, Any]:
+    spec = get_backend_spec(backend)
+    local_sessions = discover_local_sessions(backend, workspace_root) if spec.supports_local_discovery else []
+    if local_sessions:
+        return {"sessions": local_sessions, "nextCursor": None}
+    await ensure_server(backend, socket_path, workspace_root)
+    payload: dict[str, Any] = {"action": "list_sessions"}
+    if cursor is not None:
+        payload["cursor"] = cursor
+    return await _send_socket_request(socket_path, payload)
+
+
+def load_persisted_state(state_path: Path) -> dict[str, Any]:
+    try:
+        if not state_path.exists():
+            return {}
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+async def send_simple_action(socket_path: Path, action: str) -> dict[str, Any]:
+    return await _send_socket_request(socket_path, {"action": action})
+
+
+async def submit_prompt_via_socket(
+    socket_path: Path,
+    prompt: str,
+    *,
+    workspace_root: Optional[Path] = None,
+    session_mode: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {"action": "submit_prompt", "prompt": prompt}
+    if workspace_root is not None:
+        payload["workspaceRoot"] = str(workspace_root)
+    if session_mode is not None:
+        payload["sessionMode"] = session_mode
+    if session_id is not None:
+        payload["sessionId"] = session_id
+    return await _send_socket_request(socket_path, payload)
+
+
+async def list_jobs(socket_path: Path) -> dict[str, Any]:
+    return await _send_socket_request(socket_path, {"action": "list_jobs"})
+
+
+async def get_job_status(socket_path: Path, job_id: str) -> dict[str, Any]:
+    return await _send_socket_request(socket_path, {"action": "job_status", "jobId": job_id})
+
+
+async def get_job_events(socket_path: Path, job_id: str, offset: int = 0) -> dict[str, Any]:
+    return await _send_socket_request(socket_path, {"action": "job_events", "jobId": job_id, "offset": offset})
+
+
+async def resolve_prompt_session(
+    backend: str,
+    socket_path: Path,
+    workspace_root: Path,
+    command: str,
+    session_mode: Optional[str],
+) -> tuple[Optional[str], Optional[str]]:
+    if command == "resume" and session_mode is None:
+        session_mode = "latest"
+    elif command == "pick" and session_mode is None:
+        session_mode = "pick"
+
+    session_id = None
+    if session_mode in {"latest", "pick"}:
+        sessions_result = await fetch_sessions(backend, socket_path, workspace_root)
+        sessions = sessions_result.get("sessions") or []
+        if session_mode == "latest":
+            session_id = sessions[0].get("sessionId") if sessions else None
+        else:
+            session_id = pick_session_interactively(sessions)
+        session_mode = None if session_id else "new"
+    elif session_mode and session_mode not in {"current", "new"}:
+        session_id = session_mode
+        session_mode = None
+
+    return session_mode, session_id
+
+
+def format_jobs_table(jobs: list[dict[str, Any]]) -> str:
+    if not jobs:
+        return "No jobs found."
+    lines = ["JOB ID           STATUS     CREATED AT      PROMPT"]
+    for job in jobs:
+        job_id = str(job.get("jobId") or "-")[:16]
+        status = str(job.get("status") or "-")[:10]
+        created = str(job.get("createdAt") or "-")[:16]
+        prompt = str(job.get("prompt") or "")[:80]
+        lines.append(f"{job_id:<16} {status:<10} {created:<16} {prompt}")
+    return "\n".join(lines)
+
+
+async def follow_job(socket_path: Path, job_id: str, *, plain: bool = True, poll_interval: float = 1.0) -> int:
+    offset = 0
+    while True:
+        result = await get_job_events(socket_path, job_id, offset)
+        events = result.get("events") or []
+        offset = int(result.get("nextOffset") or offset)
+        for event in events:
+            kind = event.get("type")
+            if kind == "chunk":
+                text = event.get("text", "")
+                if plain:
+                    print(text, end="", flush=True)
+                else:
+                    print(json.dumps(event, ensure_ascii=False))
+            elif kind == "tool_call":
+                print(f"\n[tool] {event.get('title') or event.get('toolCallId')}", file=sys.stderr)
+            elif kind == "tool_update":
+                print(f"\n[tool:{event.get('status')}] {event.get('title') or event.get('toolCallId')}", file=sys.stderr)
+            elif kind == "usage":
+                print(f"\n[usage] {json.dumps(event.get('data'), ensure_ascii=False)}", file=sys.stderr)
+            elif kind == "terminal_output":
+                stream_name = event.get("stream", "terminal")
+                text = event.get("text", "")
+                print(f"\n[terminal:{stream_name}] {text}", end="", file=sys.stderr, flush=True)
+            elif kind == "event":
+                print(f"\n[event] {json.dumps(event.get('data'), ensure_ascii=False)}", file=sys.stderr)
+            elif kind == "error":
+                print(event.get("message", "Unknown bridge error"), file=sys.stderr)
+                return 1
+        if result.get("done"):
+            return 0 if result.get("status") == "completed" else 1
+        await asyncio.sleep(poll_interval)
+
+
+async def main_async() -> int:
+    parser = argparse.ArgumentParser(description="Persistent ACP bridge for Gemini, Qwen, and Codex")
+    parser.add_argument("command", choices=["serve", "prompt", "resume", "pick", "status", "reset", "close", "sessions", "new", "submit", "jobs", "follow", "job-status"], help="Bridge command")
+    parser.add_argument("text", nargs="*", help="Prompt text or job id")
+    parser.add_argument("--backend", choices=SUPPORTED_BACKENDS, default="gemini", help="ACP backend to use")
+    parser.add_argument("--socket", default=None, help="Unix socket path")
+    parser.add_argument("--workspace", default=str(DEFAULT_WORKSPACE), help="Workspace root")
+    parser.add_argument("--session", default=None, help="Session selector: current, latest, new, pick, or a specific session ID")
+    parser.add_argument("--cursor", default=None, help="Cursor for paginated session listing")
+    parser.add_argument("--no-plain", action="store_true", help="Print JSON events instead of plain streaming text")
+    try:
+        args = parser.parse_intermixed_args()
+    except AttributeError:
+        args = parser.parse_args()
+
+    backend = args.backend
+    runtime_paths = get_runtime_paths(backend)
+    socket_path = Path(args.socket) if args.socket else runtime_paths.socket
+    workspace_root = Path(args.workspace).resolve()
+
+    if args.command == "serve":
+        await run_server(backend, socket_path, workspace_root)
+        return 0
+
+    if args.command == "close":
+        if socket_path.exists():
+            try:
+                result = await send_simple_action(socket_path, "close")
+                print(json.dumps(result))
+                return 0
+            except Exception as exc:
+                print(json.dumps({"closed": False, "backend": backend, "error": str(exc)}))
+                return 1
+        try:
+            runtime_paths.state.unlink()
+        except FileNotFoundError:
+            pass
+        print(json.dumps({"closed": True, "backend": backend}))
+        return 0
+
+    if args.command == "status":
+        status = {"running": False, "backend": backend, "socket": str(socket_path)}
+        if socket_path.exists():
+            try:
+                status.update(await send_simple_action(socket_path, "status"))
+            except Exception as exc:
+                status["error"] = str(exc)
+        persisted = load_persisted_state(runtime_paths.state)
+        if persisted:
+            status["sessionId"] = status.get("sessionId") or persisted.get("sessionId")
+            status["workspaceRoot"] = status.get("workspaceRoot") or persisted.get("workspaceRoot")
+        print(json.dumps(status))
+        return 0 if status["running"] else 1
+
+    if args.command == "reset":
+        if socket_path.exists():
+            try:
+                await send_simple_action(socket_path, "reset")
+            except Exception:
+                pass
+        try:
+            runtime_paths.state.unlink()
+        except FileNotFoundError:
+            pass
+        print(json.dumps({"reset": True, "backend": backend}))
+        return 0
+
+    if args.command == "sessions":
+        result = await fetch_sessions(backend, socket_path, workspace_root, args.cursor)
+        print(format_sessions_table(result.get("sessions") or []))
+        return 0
+
+    if args.command == "jobs":
+        await ensure_server(backend, socket_path, workspace_root)
+        result = await list_jobs(socket_path)
+        print(format_jobs_table(result.get("jobs") or []))
+        return 0
+
+    if args.command == "job-status":
+        if not args.text:
+            raise BridgeError("Job id is required")
+        await ensure_server(backend, socket_path, workspace_root)
+        result = await get_job_status(socket_path, args.text[0])
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+
+    if args.command == "follow":
+        if not args.text:
+            raise BridgeError("Job id is required")
+        await ensure_server(backend, socket_path, workspace_root)
+        return await follow_job(socket_path, args.text[0], plain=not args.no_plain)
+
+    if args.command == "new":
+        await ensure_server(backend, socket_path, workspace_root)
+        if args.text:
+            return await prompt_via_socket(socket_path, " ".join(args.text), plain=not args.no_plain, workspace_root=workspace_root, session_mode="new")
+        result = await _send_socket_request(socket_path, {"action": "new_session"})
+        print(json.dumps(result))
+        return 0
+
+    if args.command == "submit":
+        if not args.text:
+            raise BridgeError("Prompt text is required")
+        session_mode, session_id = await resolve_prompt_session(
+            backend,
+            socket_path,
+            workspace_root,
+            "prompt",
+            args.session,
+        )
+        await ensure_server(backend, socket_path, workspace_root)
+        result = await submit_prompt_via_socket(
+            socket_path,
+            " ".join(args.text),
+            workspace_root=workspace_root,
+            session_mode=session_mode,
+            session_id=session_id,
+        )
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+
+    if args.command in {"prompt", "resume", "pick"}:
+        if not args.text:
+            raise BridgeError("Prompt text is required")
+        session_mode, session_id = await resolve_prompt_session(
+            backend,
+            socket_path,
+            workspace_root,
+            args.command,
+            args.session,
+        )
+
+        await ensure_server(backend, socket_path, workspace_root)
+        return await prompt_via_socket(
+            socket_path,
+            " ".join(args.text),
+            plain=not args.no_plain,
+            workspace_root=workspace_root,
+            session_mode=session_mode,
+            session_id=session_id,
+        )
+
+    return 0
+
+
+def main() -> None:
+    try:
+        os.umask(0o077)
+    except Exception:
+        pass
+    try:
+        raise SystemExit(asyncio.run(main_async()))
+    except KeyboardInterrupt:
+        raise SystemExit(130)
+
+
+if __name__ == "__main__":
+    main()

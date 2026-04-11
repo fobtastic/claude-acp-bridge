@@ -4,18 +4,25 @@ A personal [Claude Code](https://claude.ai/code) plugin that gives Claude Code d
 
 ## What this plugin does
 
-- Wraps `~/agent-extensions/acp-tool` (a persistent ACP bridge for Gemini, Qwen, and Codex) in 12 Claude Code slash commands
+- **Bundles its own ACP client** (`plugins/acp-bridge/bin/acp-client`, a single-file Python 3 stdlib implementation) — no separate install step needed for the bridge itself
+- Wraps the bundled client in 12 Claude Code slash commands that manage persistent Gemini / Qwen / Codex sessions
 - Both you and Claude (the model) can invoke any command — slash commands are model-invokable by default
 - **Smart session lifecycle**: idle bridges get closed on session end, but bridges with in-flight background jobs are preserved so long-running work survives a Claude Code restart
 - **Background job watcher (daemon mode)**: a long-lived poller runs for the entire session, queues completion reports to a pending file, fires Telegram pings instantly, and injects queued reports into the model's context on your next message via a `UserPromptSubmit` hook. Handles unlimited job completions per session with no restart required.
 - **Self-healing**: if the watcher daemon crashes, it's automatically respawned on your next turn
-- Portable across machines via a git repo; `ACP_TOOL_BIN` env var overrides the default tool path
+- Portable across machines — install the plugin and everything including the client comes with it
 
 ## Prerequisites
 
 - [Claude Code](https://claude.ai/code) CLI installed
-- `~/agent-extensions/acp-tool` executable, OR a different path set via `ACP_TOOL_BIN` env var
-- `python3` and `curl` in `$PATH` (used by the watcher and telegram helper)
+- **Python 3.9+** in `$PATH` (the bundled `acp-client` is a pure-stdlib Python script)
+- **`curl`** in `$PATH` (used by the Telegram helper)
+- **The external backend CLIs you want to use**, installed and authenticated separately:
+  - `gemini` — for the gemini backend
+  - `qwen` — for the qwen backend
+  - `codex` — for the codex backend
+
+  You only need the CLI(s) for backends you actually use. The plugin's `acp-client` shells out to whichever of these are on your `$PATH`.
 - Optional: the [Claude Code Telegram plugin](https://github.com/anthropics/claude-plugins-official) configured (for AFK notifications — see [Telegram setup](#telegram-notifications-optional))
 
 ## Install
@@ -27,7 +34,7 @@ claude plugin marketplace add fobtastic/claude-acp-bridge
 claude plugin install acp-bridge@claude-acp-bridge
 ```
 
-Restart Claude Code. The 12 `/acp-*` slash commands and the lifecycle hooks will be loaded automatically.
+Restart Claude Code. The 12 `/acp-*` slash commands, the lifecycle hooks, and the bundled `acp-client` binary will all load automatically — no separate ACP tool install step.
 
 ### From a local clone
 
@@ -155,7 +162,7 @@ All are removed on `SessionEnd`.
 
 The plugin spawns a long-lived background poller at `SessionStart` (via an asyncRewake hook used purely as a "spawn-and-forget" vehicle — no wake-on-exit semantics). It runs for the entire session:
 
-1. Polls `acp-tool --backend <b> jobs` for all three backends every 30 seconds (configurable via `ACP_BRIDGE_WATCH_INTERVAL`)
+1. Polls `acp-client --backend <b> jobs` for all three backends every 30 seconds (configurable via `ACP_BRIDGE_WATCH_INTERVAL`)
 2. Compares snapshots to detect terminal transitions (any job → completed / succeeded / failed / error / cancelled / done)
 3. When a transition is detected:
    - **Appends** a formatted report to `~/.cache/claude-acp-bridge/sessions/<session_id>.pending`
@@ -186,7 +193,7 @@ All configuration is via environment variables. Set them in your shell profile o
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `ACP_TOOL_BIN` | `$HOME/agent-extensions/acp-tool` | Path to the acp-tool binary |
+| `ACP_CLIENT_BIN` | `<plugin>/bin/acp-client` | Path to the ACP client binary. Defaults to the bundled client; override only if you want to point at a different implementation. |
 | `ACP_BRIDGE_WATCH_INTERVAL` | `30` | Watcher poll interval in seconds |
 | `ACP_BRIDGE_TELEGRAM_CHAT_ID` | *(unset)* | If set, watcher posts job-completion messages to this Telegram chat ID |
 | `TELEGRAM_BOT_TOKEN` | *(auto)* | Telegram bot token. If unset, read from `~/.claude/channels/telegram/.env` (reuses the Claude Code Telegram plugin's bot) |
@@ -240,8 +247,9 @@ The Claude Code Telegram plugin runs one MCP server instance per Claude Code pro
 - **Design doc**: `docs/superpowers/specs/2026-04-11-acp-bridge-plugin-design.md`
 - **Implementation plan**: `docs/superpowers/plans/2026-04-11-acp-bridge-plugin.md`
 - **Key files**:
+  - `plugins/acp-bridge/bin/acp-client` — **the bundled ACP client** (single-file Python 3 stdlib implementation; ~1700 lines). Handles the ACP protocol, per-backend Unix-socket RPC, session state, and background job lifecycle. Shells out to external `gemini` / `qwen` / `codex` CLIs for the actual model calls.
   - `plugins/acp-bridge/commands/*.md` — the 12 slash command definitions
-  - `plugins/acp-bridge/scripts/acp.sh` — shared argument parser and dispatcher for all commands
+  - `plugins/acp-bridge/scripts/acp.sh` — shared argument parser and dispatcher that invokes the bundled client
   - `plugins/acp-bridge/scripts/session-hook.sh` — SessionStart / SessionEnd handler (tracking + smart cleanup)
   - `plugins/acp-bridge/scripts/job-watcher.sh` — long-lived daemon poller that queues transition reports and fires Telegram
   - `plugins/acp-bridge/scripts/inject-pending.sh` — UserPromptSubmit hook that drains queued reports into the model's context and self-heals the watcher
