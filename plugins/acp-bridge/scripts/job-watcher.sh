@@ -120,22 +120,37 @@ trap cleanup_and_exit TERM INT
 
 # snapshot_jobs: emit one line per (backend, job_id) pair in the format
 #   backend:job_id:status
-# sorted and deduplicated. Silently skips backends whose bridge is not
-# running or whose `jobs` call errors (stderr is swallowed).
+# plus one synthetic `backend:__probed__:ok` marker per backend whose
+# bridge responded successfully. Silently skips backends whose bridge is
+# not running or whose `jobs` call errors — those backends are absent
+# from the snapshot, marking them "not probed" for the transition diff.
 #
-# Expected acp-tool output format (verified via reconnaissance):
+# The __probed__ marker distinguishes "this backend had zero jobs" (probed,
+# header row returned, zero data rows) from "this backend was down" (no
+# output at all). Transition detection in the python diff only fires for
+# backends that were probed in BOTH snapshots — so a bridge that comes up
+# for the first time (startup or mid-session) contributes a baseline
+# without firing stale reports for its pre-existing jobs.
+#
+# Expected acp-client output format:
 #   JOB ID           STATUS     CREATED AT      PROMPT
 #   job_15ec13237179 failed     1775881017.86968 Reply with exactly: ...
 snapshot_jobs() {
   local b output
   for b in "${BACKENDS[@]}"; do
-    # Wrap acp-tool in `timeout` so a hung bridge socket can't freeze the
-    # watcher loop. 10s is well above normal response time (~500ms) while
-    # staying far below the default 30s poll interval.
+    # Wrap acp-client in `timeout` so a hung bridge socket can't freeze
+    # the watcher loop. 10s is well above normal response time (~500ms)
+    # while staying far below the default 30s poll interval.
     output=$(timeout 10 "$BIN" --backend "$b" jobs 2>/dev/null || true)
     if [ -z "$output" ]; then
+      # Bridge is down or errored — do NOT emit a probed marker. This
+      # backend is absent from the snapshot, so any jobs it returns
+      # later will be treated as discovery, not transitions.
       continue
     fi
+    # Bridge responded (even if just the header row). Mark as probed and
+    # emit any parseable job rows.
+    echo "${b}:__probed__:ok"
     BACKEND="$b" python3 -c '
 import os, sys
 
@@ -166,15 +181,21 @@ while true; do
   snapshot_jobs > "$TMP_CURRENT"
 
   # Detect transitions: any (backend, job_id) whose current status is
-  # terminal and differs from its previous status (including "not seen
-  # before").
+  # terminal AND whose backend was probed in BOTH snapshots AND whose
+  # previous status differs (including "not seen before").
+  #
+  # The "probed in both snapshots" guard is what prevents stale reports
+  # from firing on first-observation of a backend whose bridge was down
+  # during the previous poll (e.g., at session startup or after a mid-
+  # session bridge restart).
   report=$(LAST_FILE="$LAST_FILE" CURR_FILE="$TMP_CURRENT" python3 <<'PY'
 import os
 
 TERMINAL = {"completed", "succeeded", "failed", "error", "cancelled", "canceled", "done"}
 
 def parse(path):
-    d = {}
+    jobs = {}
+    probed = set()
     try:
         with open(path) as f:
             for line in f:
@@ -182,20 +203,32 @@ def parse(path):
                 if not line:
                     continue
                 parts = line.split(":", 2)
-                if len(parts) == 3:
-                    d[(parts[0], parts[1])] = parts[2]
+                if len(parts) != 3:
+                    continue
+                backend, key, status = parts
+                if key == "__probed__":
+                    probed.add(backend)
+                else:
+                    jobs[(backend, key)] = status
     except FileNotFoundError:
         pass
-    return d
+    return jobs, probed
 
-last = parse(os.environ["LAST_FILE"])
-curr = parse(os.environ["CURR_FILE"])
+last_jobs, last_probed = parse(os.environ["LAST_FILE"])
+curr_jobs, _curr_probed = parse(os.environ["CURR_FILE"])
 
 transitions = []
-for key, curr_status in curr.items():
-    last_status = last.get(key)
-    if curr_status in TERMINAL and last_status != curr_status:
-        backend, job_id = key
+for key, curr_status in curr_jobs.items():
+    backend, job_id = key
+    # Suppress fires from backends that were NOT probed in the previous
+    # snapshot. If we've never successfully observed this backend before,
+    # its entries are "discovered history", not transitions.
+    if backend not in last_probed:
+        continue
+    if curr_status not in TERMINAL:
+        continue
+    last_status = last_jobs.get(key)
+    if last_status != curr_status:
         transitions.append((backend, job_id, curr_status))
 
 if transitions:
