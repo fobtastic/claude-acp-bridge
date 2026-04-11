@@ -3,25 +3,15 @@
 # Invoked from each slash command in ../commands/*.md.
 #
 # Usage: acp.sh <subcommand> [arguments...]
-#
-# Resolves the ACP client path from $ACP_CLIENT_BIN, defaulting to the
-# bundled `../bin/acp-client` Python binary that ships with the plugin.
-# Parses the remaining arguments according to the subcommand's conventions
-# and invokes the underlying client.
 
 set -euo pipefail
 
-# Derive the plugin's bin path from this script's real location so the
-# default works regardless of $CLAUDE_PLUGIN_ROOT (which can be polluted
-# by other plugins when running from hook subprocesses).
-SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
-DEFAULT_BIN="$(dirname "$SCRIPT_DIR")/bin/acp-client"
-BIN="${ACP_CLIENT_BIN:-$DEFAULT_BIN}"
-BACKENDS_ALL=(gemini qwen codex)
+# shellcheck source=_lib.sh
+. "$(dirname "$(readlink -f "$0")")/_lib.sh"
 
-if [ ! -x "$BIN" ]; then
-  echo "acp-bridge: client not found or not executable: $BIN" >&2
-  echo "The plugin ships with a bundled client at $DEFAULT_BIN." >&2
+if [ ! -x "$ACP_CLIENT_BIN" ]; then
+  echo "acp-bridge: client not found or not executable: $ACP_CLIENT_BIN" >&2
+  echo "The plugin ships with a bundled client at $DEFAULT_ACP_CLIENT_BIN." >&2
   echo "Override with ACP_CLIENT_BIN if you want a different binary." >&2
   exit 127
 fi
@@ -33,46 +23,31 @@ fi
 
 SUBCOMMAND="$1"
 shift
-
-# Collapse all remaining args back into a single string. Slash commands pass
-# "$ARGUMENTS" as one quoted argument, so $# is typically 0 or 1 here.
+# Slash commands pass "$ARGUMENTS" as one quoted argument, so $# is typically 0 or 1.
 ARGS="${*:-}"
 
-is_valid_backend() {
-  case "$1" in
-    gemini|qwen|codex) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
 track_invocation() {
-  # Append <backend> to the session state file, if tracking is active.
-  # No-op outside a Claude Code session.
+  # Append the backend to the session state file. Called for every bridge
+  # touch so session-end cleanup knows which bridges this session used.
   #
-  # NOTE: We track backend only (not (backend, workspace)) because acp-tool
-  # bridges are global singletons per backend — --workspace only affects the
-  # working directory for commands, not the bridge process identity. Closing
-  # "the gemini bridge at workspace X" is the same as closing "the gemini
-  # bridge".
+  # We track backend only (not per-workspace): acp-client bridges are
+  # global singletons per backend; --workspace just scopes working dir.
+  #
+  # Always append — the consumer (session-hook.sh end) reads with
+  # `sort -u`, so duplicates are free and avoiding the check dodges a
+  # TOCTOU window between concurrent slash commands.
   local backend="$1"
-  if [ -z "${CLAUDE_ACP_SESSION_FILE:-}" ]; then
+  if [ -z "${CLAUDE_ACP_SESSION_FILE:-}" ] || [ ! -f "$CLAUDE_ACP_SESSION_FILE" ]; then
     return 0
   fi
-  if [ ! -f "$CLAUDE_ACP_SESSION_FILE" ]; then
-    return 0
-  fi
-  if ! grep -qxF "$backend" "$CLAUDE_ACP_SESSION_FILE" 2>/dev/null; then
-    printf '%s\n' "$backend" >> "$CLAUDE_ACP_SESSION_FILE"
-  fi
+  printf '%s\n' "$backend" >> "$CLAUDE_ACP_SESSION_FILE"
 }
 
 split_backend_and_text() {
   # Populates BACKEND and TEXT from $1. Splits on any run of whitespace
   # (space or tab) and trims surrounding whitespace from both halves.
   local raw="$1"
-  # Trim leading whitespace.
   raw="${raw#"${raw%%[![:space:]]*}"}"
-  # Trim trailing whitespace.
   raw="${raw%"${raw##*[![:space:]]}"}"
   if [ -z "$raw" ]; then
     BACKEND=""
@@ -88,23 +63,25 @@ split_backend_and_text() {
   fi
 }
 
+invalid_backend_exit() {
+  echo "acp-bridge: invalid backend '$1' (expected $(backends_display))" >&2
+  exit 2
+}
+
 run_info_command() {
   # Subcommands where an empty backend means "run for all three".
   local sub="$1"
   if [ -z "$ARGS" ]; then
-    for b in "${BACKENDS_ALL[@]}"; do
+    for b in "${BACKENDS[@]}"; do
       echo "## $b"
       track_invocation "$b"
-      "$BIN" --backend "$b" "$sub" || true
+      "$ACP_CLIENT_BIN" --backend "$b" "$sub" || true
       echo
     done
   else
-    if ! is_valid_backend "$ARGS"; then
-      echo "acp-bridge: invalid backend '$ARGS' (expected gemini, qwen, or codex)" >&2
-      exit 2
-    fi
+    is_valid_backend "$ARGS" || invalid_backend_exit "$ARGS"
     track_invocation "$ARGS"
-    "$BIN" --backend "$ARGS" "$sub"
+    "$ACP_CLIENT_BIN" --backend "$ARGS" "$sub"
   fi
 }
 
@@ -115,12 +92,9 @@ run_backend_only_command() {
     echo "Usage: /acp-$sub <backend>" >&2
     exit 2
   fi
-  if ! is_valid_backend "$ARGS"; then
-    echo "acp-bridge: invalid backend '$ARGS' (expected gemini, qwen, or codex)" >&2
-    exit 2
-  fi
+  is_valid_backend "$ARGS" || invalid_backend_exit "$ARGS"
   track_invocation "$ARGS"
-  "$BIN" --backend "$ARGS" "$sub"
+  "$ACP_CLIENT_BIN" --backend "$ARGS" "$sub"
 }
 
 run_backend_and_text_command() {
@@ -133,12 +107,9 @@ run_backend_and_text_command() {
     echo "Usage: /acp-$sub <backend> $usage_text" >&2
     exit 2
   fi
-  if ! is_valid_backend "$BACKEND"; then
-    echo "acp-bridge: invalid backend '$BACKEND' (expected gemini, qwen, or codex)" >&2
-    exit 2
-  fi
+  is_valid_backend "$BACKEND" || invalid_backend_exit "$BACKEND"
   track_invocation "$BACKEND"
-  "$BIN" --backend "$BACKEND" "$sub" "$TEXT"
+  "$ACP_CLIENT_BIN" --backend "$BACKEND" "$sub" "$TEXT"
 }
 
 case "$SUBCOMMAND" in

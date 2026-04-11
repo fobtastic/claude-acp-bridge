@@ -4,7 +4,7 @@
 #
 # How it fits into Option B's delivery pipeline:
 #   1. job-watcher.sh (long-lived daemon) detects job transitions and
-#      appends reports to $STATE_DIR/<session>.pending
+#      appends reports to <session>.pending
 #   2. On every user prompt, Claude Code runs this hook
 #   3. This hook atomically renames .pending -> .pending.inflight so the
 #      watcher's next append goes to a fresh .pending without racing our
@@ -19,88 +19,58 @@
 
 set -uo pipefail
 
-STATE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/claude-acp-bridge/sessions"
-PLUGIN_ROOT="$(dirname "$(dirname "$(readlink -f "$0")")")"
+# shellcheck source=_lib.sh
+. "$(dirname "$(readlink -f "$0")")/_lib.sh"
 
-# Read session_id from stdin JSON. If we can't parse it, bail silently —
-# failing the hook would block the user's prompt.
-input=$(cat 2>/dev/null || true)
-if [ -z "$input" ]; then
-  exit 0
-fi
+session_id=$(read_session_id_from_stdin)
+[ -z "$session_id" ] && exit 0
+session_paths "$session_id"
 
-session_id=$(python3 -c "
-import json, sys
-try:
-    print(json.loads(sys.stdin.read()).get('session_id', ''))
-except Exception:
-    print('')
-" <<<"$input" 2>/dev/null || true)
-
-if [ -z "$session_id" ]; then
-  exit 0
-fi
-
-PENDING_FILE="$STATE_DIR/${session_id}.pending"
-INFLIGHT_FILE="$STATE_DIR/${session_id}.pending.inflight"
-PID_FILE="$STATE_DIR/${session_id}.watcher.pid"
-
-# Self-heal: if the watcher is not alive, spawn a replacement. We do this
-# BEFORE draining so a fresh watcher is running regardless of whether
-# there's anything to inject right now.
+# Self-heal: if no live watcher holds the PID file, spawn a replacement.
+# Done BEFORE draining so a crashed watcher gets replaced regardless of
+# whether there's anything to inject this turn.
 watcher_alive=0
-if [ -f "$PID_FILE" ]; then
-  existing_pid=$(cat "$PID_FILE" 2>/dev/null || true)
+if [ -f "$SESSION_PID_FILE" ]; then
+  existing_pid=$(cat "$SESSION_PID_FILE" 2>/dev/null || true)
   if [ -n "$existing_pid" ] && kill -0 "$existing_pid" 2>/dev/null; then
     watcher_alive=1
   fi
 fi
 
 if [ "$watcher_alive" = "0" ] && [ -x "$PLUGIN_ROOT/scripts/job-watcher.sh" ]; then
-  # Respawn detached. Pass session_id via env so the watcher doesn't need
-  # stdin JSON. Route stdio to /dev/null and setsid to fully detach from
-  # the hook's process group, so the watcher survives this hook exiting.
+  # Respawn detached. setsid + </dev/null + disown fully detaches from the
+  # hook's process group so the watcher survives this hook exiting. The
+  # watcher reads session_id from $ACP_BRIDGE_WATCHER_SESSION_ID rather
+  # than stdin JSON, since we've already consumed stdin here.
   ACP_BRIDGE_WATCHER_SESSION_ID="$session_id" \
     setsid bash "$PLUGIN_ROOT/scripts/job-watcher.sh" \
     </dev/null >/dev/null 2>&1 &
   disown 2>/dev/null || true
 fi
 
-# Drain the pending file atomically. mv is atomic on the same filesystem,
-# so the watcher's next append (to the now-missing .pending) creates a
-# fresh file that this hook will pick up on the next turn.
-if [ ! -f "$PENDING_FILE" ]; then
+# Drain the pending file atomically. `mv` is atomic on the same
+# filesystem: the watcher's next append (to the now-missing .pending)
+# creates a fresh file, picked up on the next turn. If .pending doesn't
+# exist yet, mv fails cleanly — nothing to inject, exit.
+mv "$SESSION_PENDING_FILE" "$SESSION_INFLIGHT_FILE" 2>/dev/null || exit 0
+
+if [ ! -s "$SESSION_INFLIGHT_FILE" ]; then
+  rm -f "$SESSION_INFLIGHT_FILE"
   exit 0
 fi
 
-if ! mv "$PENDING_FILE" "$INFLIGHT_FILE" 2>/dev/null; then
-  exit 0
-fi
+# Emit the hook response. Python JSON-encodes safely (newlines, quotes,
+# unicode). Claude Code injects `additionalContext` as a system reminder.
+PENDING_CONTENT=$(cat "$SESSION_INFLIGHT_FILE")
+rm -f "$SESSION_INFLIGHT_FILE"
 
-# Read inflight, remove it, emit as additional context. Skip injection if
-# the file is empty (e.g. a prior turn drained it and a race left an
-# empty file behind).
-if [ ! -s "$INFLIGHT_FILE" ]; then
-  rm -f "$INFLIGHT_FILE"
-  exit 0
-fi
-
-# Emit the hook-specific JSON response. Claude Code injects the
-# `additionalContext` string as a system reminder visible to the model.
-PENDING_CONTENT=$(cat "$INFLIGHT_FILE")
-rm -f "$INFLIGHT_FILE"
-
-# Use python to JSON-encode the content safely (preserves newlines,
-# escapes quotes, handles unicode).
-PAYLOAD=$(python3 -c "
+python3 -c '
 import json, sys
 content = sys.stdin.read()
 print(json.dumps({
-    'hookSpecificOutput': {
-        'hookEventName': 'UserPromptSubmit',
-        'additionalContext': content,
+    "hookSpecificOutput": {
+        "hookEventName": "UserPromptSubmit",
+        "additionalContext": content,
     }
 }))
-" <<<"$PENDING_CONTENT")
-
-printf '%s\n' "$PAYLOAD"
+' <<<"$PENDING_CONTENT"
