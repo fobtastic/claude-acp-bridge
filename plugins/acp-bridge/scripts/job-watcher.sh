@@ -26,7 +26,12 @@ BIN="${ACP_TOOL_BIN:-$HOME/agent-extensions/acp-tool}"
 BACKENDS=(gemini qwen codex)
 INTERVAL="${ACP_BRIDGE_WATCH_INTERVAL:-30}"
 STATE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/claude-acp-bridge/sessions"
-PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-$(dirname "$(dirname "$(readlink -f "$0")")")}"
+# Always derive PLUGIN_ROOT from this script's real path. We intentionally
+# do NOT trust $CLAUDE_PLUGIN_ROOT here: the Claude Code parent process can
+# leak another plugin's root into the hook subprocess environment, which
+# would make $PLUGIN_ROOT/scripts/notify-telegram.sh resolve to a non-
+# existent path and silently skip Telegram dispatch.
+PLUGIN_ROOT="$(dirname "$(dirname "$(readlink -f "$0")")")"
 
 # Read session_id from stdin JSON (same pattern as session-hook.sh).
 input=$(cat 2>/dev/null || true)
