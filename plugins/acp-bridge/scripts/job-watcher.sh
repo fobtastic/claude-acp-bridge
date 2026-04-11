@@ -70,25 +70,42 @@ if [ ! -x "$BIN" ]; then
 fi
 
 mkdir -p "$STATE_DIR"
-LOCK_DIR="$STATE_DIR/${session_id}.watcher.lock"
+PID_FILE="$STATE_DIR/${session_id}.watcher.pid"
 LAST_FILE="$STATE_DIR/${session_id}.lastjobs"
 PENDING_FILE="$STATE_DIR/${session_id}.pending"
 
-# Single-instance guard via atomic mkdir. mkdir is guaranteed to fail with
-# EEXIST if another process won the race — no TOCTOU window like a PID file
-# check-then-write. The loser exits silently; the winner writes its PID
-# inside the lock dir so SessionEnd can signal it.
-if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-  # Lock exists. Is the holder still alive?
-  existing_pid=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
+# Single-instance guard via atomic-create PID file. `set -C` (noclobber)
+# makes `> file` fail if the file already exists — this is the open(2)
+# O_CREAT|O_EXCL equivalent, which is atomic at the kernel level. We
+# intentionally do NOT use flock here: flock locks are fd-associated,
+# and bash's $(...) subshells inherit open fds, so a subshell spawned
+# mid-poll can keep a lock alive briefly after the main watcher exits,
+# blocking a fresh spawn.
+#
+# Race handling:
+#   Winner: `set -C; echo $$ > $PID_FILE` succeeds, writes own PID.
+#   Loser:  same command fails (file exists). Reads the file; if PID is
+#           alive, exits silently. If the file is momentarily empty
+#           (winner hasn't finished the echo yet — a microsecond window),
+#           retries a few times before deciding the lock is stale.
+#   Stale:  a PID file with a dead PID gets overwritten by the new spawn.
+if ! (set -C; echo $$ > "$PID_FILE") 2>/dev/null; then
+  # PID file exists. Retry-read in case the winner is mid-write.
+  existing_pid=""
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    existing_pid=$(cat "$PID_FILE" 2>/dev/null || true)
+    [ -n "$existing_pid" ] && break
+    sleep 0.05
+  done
+
   if [ -n "$existing_pid" ] && kill -0 "$existing_pid" 2>/dev/null; then
+    # A live watcher already holds it. Exit silently.
     exit 0
   fi
-  # Stale lock from a crashed watcher — take it over.
-  rm -rf "$LOCK_DIR"
-  mkdir "$LOCK_DIR" 2>/dev/null || exit 0
+
+  # Stale PID file (holder is dead). Take over.
+  echo $$ > "$PID_FILE"
 fi
-echo $$ > "$LOCK_DIR/pid"
 
 # Track the temp file used in the current poll iteration so the trap can
 # clean it up if SIGTERM arrives mid-loop.
@@ -96,7 +113,7 @@ TMP_CURRENT=""
 
 cleanup_and_exit() {
   [ -n "$TMP_CURRENT" ] && rm -f "$TMP_CURRENT"
-  rm -rf "$LOCK_DIR"
+  rm -f "$PID_FILE"
   exit 0
 }
 trap cleanup_and_exit TERM INT

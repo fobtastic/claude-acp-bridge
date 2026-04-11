@@ -43,14 +43,14 @@ fi
 
 PENDING_FILE="$STATE_DIR/${session_id}.pending"
 INFLIGHT_FILE="$STATE_DIR/${session_id}.pending.inflight"
-LOCK_DIR="$STATE_DIR/${session_id}.watcher.lock"
+PID_FILE="$STATE_DIR/${session_id}.watcher.pid"
 
 # Self-heal: if the watcher is not alive, spawn a replacement. We do this
 # BEFORE draining so a fresh watcher is running regardless of whether
 # there's anything to inject right now.
 watcher_alive=0
-if [ -d "$LOCK_DIR" ]; then
-  existing_pid=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
+if [ -f "$PID_FILE" ]; then
+  existing_pid=$(cat "$PID_FILE" 2>/dev/null || true)
   if [ -n "$existing_pid" ] && kill -0 "$existing_pid" 2>/dev/null; then
     watcher_alive=1
   fi

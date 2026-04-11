@@ -53,21 +53,21 @@ case "$ACTION" in
       exit 0
     fi
 
-    # Kill the background job watcher if it is still running, and clean
-    # up its lock dir + state files. Done before bridge cleanup so the
-    # watcher cannot race a final poll against a backend we are about to
-    # close.
-    watcher_lock_dir="$STATE_DIR/${session_id}.watcher.lock"
-    if [ -d "$watcher_lock_dir" ]; then
-      watcher_pid=$(cat "$watcher_lock_dir/pid" 2>/dev/null || true)
+    # Kill the background job watcher if it is still running. Done before
+    # bridge cleanup so the watcher cannot race a final poll against a
+    # backend we are about to close.
+    watcher_pid_file="$STATE_DIR/${session_id}.watcher.pid"
+    if [ -f "$watcher_pid_file" ]; then
+      watcher_pid=$(cat "$watcher_pid_file" 2>/dev/null || true)
       if [ -n "$watcher_pid" ] && kill -0 "$watcher_pid" 2>/dev/null; then
         kill -TERM "$watcher_pid" 2>/dev/null || true
         sleep 0.2
       fi
-      rm -rf "$watcher_lock_dir"
+      rm -f "$watcher_pid_file"
     fi
-    # Also catch legacy PID file from pre-lock-dir versions.
-    rm -f "$STATE_DIR/${session_id}.watcher.pid"
+    # Clean up all per-session state files.
+    rm -rf "$STATE_DIR/${session_id}.watcher.lock"  # legacy lock dir
+    rm -f "$STATE_DIR/${session_id}.watcher.lock"   # legacy lock file (flock)
     rm -f "$STATE_DIR/${session_id}.lastjobs"
     rm -f "$STATE_DIR/${session_id}.pending"
     rm -f "$STATE_DIR/${session_id}.pending.inflight"
