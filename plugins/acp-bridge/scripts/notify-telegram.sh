@@ -47,7 +47,11 @@ if [ -z "$MESSAGE" ]; then
 fi
 
 # Prefix with a recognizable header so users can tell where it came from.
-FULL_MESSAGE=$(printf '*acp-bridge*\n\n%s' "$MESSAGE")
+# Sent as plain text (no parse_mode) because the message body can contain
+# arbitrary characters — job ids with underscores, angle brackets in the
+# "/acp-follow <backend> <job-id>" hint, etc. — that would break Telegram's
+# Markdown/HTML parsers and return HTTP 400.
+FULL_MESSAGE=$(printf 'acp-bridge\n\n%s' "$MESSAGE")
 
 # POST to Telegram Bot API. Capture the HTTP status code via -w.
 STATUS_TMP=$(mktemp)
@@ -55,7 +59,6 @@ curl -sS -o /dev/null -w '%{http_code}' \
   "https://api.telegram.org/bot${TOKEN}/sendMessage" \
   --data-urlencode "chat_id=${CHAT_ID}" \
   --data-urlencode "text=${FULL_MESSAGE}" \
-  --data "parse_mode=Markdown" \
   > "$STATUS_TMP" 2>/dev/null || true
 
 status=$(cat "$STATUS_TMP" 2>/dev/null || echo "000")
