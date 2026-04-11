@@ -52,6 +52,21 @@ case "$ACTION" in
     if [ -z "$session_id" ]; then
       exit 0
     fi
+
+    # Kill the background job watcher if it is still running, and clean
+    # up its PID file. Done before bridge cleanup so the watcher cannot
+    # race a final poll against a backend we are about to close.
+    watcher_pid_file="$STATE_DIR/${session_id}.watcher.pid"
+    if [ -f "$watcher_pid_file" ]; then
+      watcher_pid=$(cat "$watcher_pid_file" 2>/dev/null || true)
+      if [ -n "$watcher_pid" ] && kill -0 "$watcher_pid" 2>/dev/null; then
+        kill -TERM "$watcher_pid" 2>/dev/null || true
+        sleep 0.2
+      fi
+      rm -f "$watcher_pid_file"
+    fi
+    rm -f "$STATE_DIR/${session_id}.lastjobs"
+
     state_file="$STATE_DIR/$session_id.list"
     if [ ! -f "$state_file" ]; then
       exit 0

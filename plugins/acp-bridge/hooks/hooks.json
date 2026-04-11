@@ -1,5 +1,5 @@
 {
-  "description": "Lifecycle hooks for tracking and cleaning up idle ACP bridges per Claude Code session",
+  "description": "Lifecycle hooks for tracking and cleaning up idle ACP bridges per Claude Code session, plus background job watcher for async notifications",
   "hooks": {
     "SessionStart": [
       {
@@ -8,6 +8,13 @@
             "type": "command",
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/session-hook.sh\" start",
             "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/job-watcher.sh\"",
+            "asyncRewake": true,
+            "rewakeMessage": "ACP job update (auto-detected by background watcher):",
+            "timeout": 86400
           }
         ]
       }

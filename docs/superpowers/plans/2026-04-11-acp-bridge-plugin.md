@@ -1128,6 +1128,70 @@ User must reload Claude Code so the new hooks are registered. After reload:
 
 ---
 
+## Task 8b: asyncRewake job watcher
+
+Long-lived background watcher that polls all three ACP backends on a configurable interval and wakes Claude Code via `asyncRewake` when any job transitions into a terminal state (completed/succeeded/failed/error/cancelled/done).
+
+**Files:**
+- Create: `plugins/acp-bridge/scripts/job-watcher.sh`
+- Modify: `plugins/acp-bridge/hooks/hooks.json` (add asyncRewake entry under SessionStart)
+- Modify: `plugins/acp-bridge/scripts/session-hook.sh` (kill watcher + clean lastjobs on `end`)
+
+**Design decisions:**
+- **Option Y — poll all backends, not just tracked ones.** Approved by user. Trade-off: occasional notifications for activity unrelated to the current session, in exchange for broader coverage. `acp-tool` treats each backend as a global singleton process, so the session-local tracking in `$CLAUDE_ACP_SESSION_FILE` isn't a meaningful identity filter anyway.
+- **Poll interval default 30s**, overridable via `ACP_BRIDGE_WATCH_INTERVAL`.
+- **First poll is a baseline**, never a notification — prevents spurious wake-ups for jobs that finished before the watcher started.
+- **Single-fire limitation.** `asyncRewake` fires once per hook spawn. After the watcher exits 2, re-arming requires a Claude Code session restart. A slash-command re-arm was considered and dropped because a `!command` block cannot re-register a hook-level wake. Self-healing via `PostToolUse` is deferred to v0.2.
+
+**Parser notes:** `acp-tool jobs` emits a tabular header `JOB ID STATUS CREATED AT PROMPT` followed by data lines whose first whitespace-separated token starts with `job_`. Stderr is redirected to `/dev/null` so Python tracebacks from unresponsive bridges (e.g. `BridgeError: Missing prompt` on qwen/codex when their sockets are in an odd state) don't pollute the snapshot.
+
+**Hook registration in `hooks/hooks.json`:**
+
+```json
+{
+  "type": "command",
+  "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/job-watcher.sh\"",
+  "asyncRewake": true,
+  "rewakeMessage": "ACP job update (auto-detected by background watcher):",
+  "timeout": 86400
+}
+```
+
+Added as a second hook in the `SessionStart` entry alongside the existing `session-hook.sh start` call.
+
+**Session-hook `end` additions:** Before the existing bridge-cleanup loop, read `$STATE_DIR/<session_id>.watcher.pid`, send `SIGTERM` to the recorded PID if still alive (the watcher's `trap cleanup_and_exit TERM INT` handles graceful exit), remove the PID file, and remove `<session_id>.lastjobs`.
+
+---
+
+## Task 8c: Telegram notification helper
+
+Stdin-driven helper that posts the watcher's report to Telegram for AFK push notifications.
+
+**Files:**
+- Create: `plugins/acp-bridge/scripts/notify-telegram.sh`
+
+**Design decisions:**
+- **Reuses the existing telegram plugin's bot token.** Reads `TELEGRAM_BOT_TOKEN` from env first, then falls back to parsing `~/.claude/channels/telegram/.env` (the location the telegram plugin already uses). No second bot registration required.
+- **Chat ID via `ACP_BRIDGE_TELEGRAM_CHAT_ID`.** If unset, the helper exits 0 as a silent no-op — no telegram config means no notifications, not an error.
+- **Advisory exit code.** Returns 1 on HTTP non-200, but `job-watcher.sh` ignores the exit code so a telegram outage never kills the watcher.
+- **Message format.** Prefixes the report with `*acp-bridge*` (Markdown bold) so users can tell at a glance which plugin sent it.
+
+**New env vars:**
+
+- `ACP_BRIDGE_WATCH_INTERVAL` — poll interval in seconds (default 30)
+- `ACP_BRIDGE_TELEGRAM_CHAT_ID` — target chat for telegram notifications; unset = disable
+
+**Testing approach:**
+
+Direct bash tests validate the load-bearing logic without submitting real jobs:
+1. Standalone `snapshot_jobs` invocation — confirms parser handles real `acp-tool jobs` output across all three backends (including unresponsive ones).
+2. Watcher startup smoke test — launches the watcher in the background with `ACP_BRIDGE_WATCH_INTERVAL=2`, verifies PID file and baseline are created, sends SIGTERM, verifies trap cleans up.
+3. Transition-detection unit tests — unit-tests the Python transition block with hand-crafted `$LAST_FILE`/`$CURR_FILE` pairs covering: running→terminal, terminal→terminal (no re-notify), new terminal job (first sight), partial transitions in multi-job snapshots, running→running.
+4. Telegram helper exit codes — confirms silent no-op when config missing, graceful failure when API rejects.
+5. Session-hook cleanup — fakes a watcher process, runs the end hook, verifies SIGTERM delivery and state-file removal.
+
+---
+
 ## Task 9: Write README.md and LICENSE
 
 **Files:**

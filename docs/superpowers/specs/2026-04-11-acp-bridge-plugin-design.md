@@ -280,3 +280,42 @@ An automated test suite is out of scope for v0.1.0. If the plugin grows, we can 
 
 Also, on this machine only (not in the repo):
 - Updates to `~/.claude/settings.json` (`enabledPlugins`) and/or `~/.claude/plugins/known_marketplaces.json` to register the local marketplace.
+
+## Amendment: Task 8b + Task 8c — async job watcher and telegram notifications
+
+Added after Task 8a. Extends the plugin with a long-lived background process that watches all three ACP backends for job terminal transitions and wakes Claude Code via the `asyncRewake` hook mechanism — with an optional push notification to Telegram for AFK users.
+
+### Task 8b: asyncRewake background job watcher
+
+New file `plugins/acp-bridge/scripts/job-watcher.sh`, registered as a second `SessionStart` hook alongside `session-hook.sh start`. The hook entry uses `asyncRewake: true` so Claude Code spawns the script in the background and treats a subsequent exit with code 2 as a model wake-up carrying the script's stdout as a system-reminder.
+
+The watcher:
+- Reads `session_id` from its stdin JSON payload (same shape as the existing session hook).
+- Writes `$STATE_DIR/<session_id>.watcher.pid` so `session-hook.sh end` can terminate it on session shutdown.
+- Polls all three backends (`gemini`, `qwen`, `codex`) unconditionally on each iteration — Option Y in the task design. Chosen over "only poll backends tracked in `$CLAUDE_ACP_SESSION_FILE`" because it gives broader coverage; the cost is occasional notifications for activity not tied to the current session, which the user accepts.
+- Parses the tabular `acp-tool jobs` output (`JOB ID STATUS CREATED AT PROMPT`) into `backend:job_id:status` tuples. Swallows stderr so bridge-unreachable tracebacks from backends that aren't running don't corrupt the snapshot.
+- Uses the first poll as a baseline (no notifications on startup) and compares each subsequent poll against `$STATE_DIR/<session_id>.lastjobs` to detect jobs that transitioned into a terminal state (`completed`/`succeeded`/`failed`/`error`/`cancelled`/`canceled`/`done`). A terminal-to-terminal observation does not re-fire because the previous status was already terminal-equivalent.
+- On detecting one or more transitions: writes the updated snapshot to `$LAST_FILE`, fans out to `notify-telegram.sh`, prints a human-readable report to stdout, and exits 2 to trigger `asyncRewake`.
+- Default poll interval is 30 seconds, overridable via `ACP_BRIDGE_WATCH_INTERVAL`.
+
+**Known v0.1 limitation — single-fire:** `asyncRewake` fires at most once per hook spawn. After the watcher wakes Claude Code and exits, the only way to re-arm it is to end and restart the Claude Code session. A slash-command workaround was considered and dropped because a bash snippet inside a `!command` block cannot re-register a hook-level wake at runtime. Self-healing via a `PostToolUse` hook is deferred to v0.2.
+
+### Task 8c: Telegram notification helper
+
+New file `plugins/acp-bridge/scripts/notify-telegram.sh`, invoked by `job-watcher.sh` with the report piped to stdin. The helper:
+- Reads `ACP_BRIDGE_TELEGRAM_CHAT_ID` from the environment. If unset, exits 0 as a silent no-op — no telegram config, no notification, no error.
+- Reads `TELEGRAM_BOT_TOKEN` from the environment first, then falls back to sourcing the existing telegram plugin's token from `~/.claude/channels/telegram/.env`. This avoids requiring a second bot — users who already have the telegram plugin configured get watch notifications through the same bot.
+- Posts via `curl` to `https://api.telegram.org/bot<token>/sendMessage` with `parse_mode=Markdown` and a `*acp-bridge*` prefix so the user can tell where the message came from.
+- Returns 0 on HTTP 200, 1 otherwise. The caller in `job-watcher.sh` ignores the exit code so a telegram outage never kills the watcher.
+
+### Session-hook cleanup additions
+
+`session-hook.sh end` now:
+1. Reads `$STATE_DIR/<session_id>.watcher.pid` and sends `SIGTERM` to the recorded PID if it is still running (watcher's `trap cleanup_and_exit TERM INT` handles the graceful exit path).
+2. Removes the PID file and the `.lastjobs` snapshot.
+3. Proceeds with the existing bridge-cleanup loop.
+
+### New env vars
+
+- `ACP_BRIDGE_WATCH_INTERVAL` — poll interval in seconds (default 30).
+- `ACP_BRIDGE_TELEGRAM_CHAT_ID` — if set, watcher notifications are forwarded to this Telegram chat via the telegram plugin's bot token.
