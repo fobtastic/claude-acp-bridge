@@ -7,7 +7,8 @@ A personal [Claude Code](https://claude.ai/code) plugin that gives Claude Code d
 - Wraps `~/agent-extensions/acp-tool` (a persistent ACP bridge for Gemini, Qwen, and Codex) in 12 Claude Code slash commands
 - Both you and Claude (the model) can invoke any command — slash commands are model-invokable by default
 - **Smart session lifecycle**: idle bridges get closed on session end, but bridges with in-flight background jobs are preserved so long-running work survives a Claude Code restart
-- **Background job watcher**: when a submitted ACP job completes or fails, Claude Code gets an automatic notification (via `asyncRewake` hook) and, optionally, a push notification to your phone via Telegram
+- **Background job watcher (daemon mode)**: a long-lived poller runs for the entire session, queues completion reports to a pending file, fires Telegram pings instantly, and injects queued reports into the model's context on your next message via a `UserPromptSubmit` hook. Handles unlimited job completions per session with no restart required.
+- **Self-healing**: if the watcher daemon crashes, it's automatically respawned on your next turn
 - Portable across machines via a git repo; `ACP_TOOL_BIN` env var overrides the default tool path
 
 ## Prerequisites
@@ -76,7 +77,7 @@ Save the plan to a file inside the target repo, e.g., `docs/plans/feature-x.md`.
 ### 2. Submit the plan as a background job
 
 ```
-/acp-submit qwen "Workspace: /home/ubuntu/projects/my-repo
+/acp-submit qwen "Workspace: ~/projects/my-repo
 Branch: create and work on 'qwen/feature-x'
 Plan: docs/plans/feature-x.md
 
@@ -116,7 +117,7 @@ When you reopen Claude Code:
 /acp-follow qwen <id>    # block until the job finishes, return full output
 ```
 
-Or — with the [background watcher](#background-job-watcher) running — you'll get an automatic notification inside your Claude Code session the moment qwen finishes.
+Or — with the [background watcher](#background-job-watcher) running — you'll get a notification inside your Claude Code session on your next message after qwen finishes.
 
 ### 5. (Optional) AFK notifications to your phone
 
@@ -132,7 +133,17 @@ Without cleanup, these bridges would accumulate indefinitely. The plugin tracks 
 - If `activeJobs > 0`: **leave it alone** (background work in flight)
 - If `activeJobs == 0`: **close the bridge** (release memory)
 
-Tracking state lives at `~/.cache/claude-acp-bridge/sessions/<session_id>.list`. Per-session state files are removed on cleanup.
+Per-session state files live in `~/.cache/claude-acp-bridge/sessions/`:
+
+| File | Purpose |
+|---|---|
+| `<session>.list` | Backends touched this session (one per line) |
+| `<session>.lastjobs` | Watcher's job snapshot for transition diffing |
+| `<session>.watcher.pid` | PID of the running watcher daemon |
+| `<session>.pending` | Queued completion reports awaiting the next user turn |
+| `<session>.pending.inflight` | Transient — drained-but-not-yet-injected reports |
+
+All are removed on `SessionEnd`.
 
 ### Known cleanup limitations
 
@@ -142,20 +153,32 @@ Tracking state lives at `~/.cache/claude-acp-bridge/sessions/<session_id>.list`.
 
 ## Background job watcher
 
-The plugin spawns a long-lived background poller at `SessionStart` (via a `SessionStart` asyncRewake hook). It:
+The plugin spawns a long-lived background poller at `SessionStart` (via an asyncRewake hook used purely as a "spawn-and-forget" vehicle — no wake-on-exit semantics). It runs for the entire session:
 
-1. Polls `acp-tool --backend <b> jobs` for all three backends every 30 seconds (configurable)
+1. Polls `acp-tool --backend <b> jobs` for all three backends every 30 seconds (configurable via `ACP_BRIDGE_WATCH_INTERVAL`)
 2. Compares snapshots to detect terminal transitions (any job → completed / succeeded / failed / error / cancelled / done)
 3. When a transition is detected:
-   - Writes a report to stdout and exits with code 2
-   - `asyncRewake` on the hook wakes Claude Code with the report as a system-reminder
-   - You see "ACP job update: ..." in the transcript and Claude can react (read the full output, summarize, kick off a follow-up job)
-4. Also fires a Telegram notification if configured (see below)
+   - **Appends** a formatted report to `~/.cache/claude-acp-bridge/sessions/<session_id>.pending`
+   - **Immediately** fires a Telegram push to your phone (if configured) — this is instant, not deferred
+   - **Keeps polling** — the watcher is a true daemon, it does not exit after firing
+4. On your next message to Claude, a `UserPromptSubmit` hook (`inject-pending.sh`) atomically drains the pending file and injects its contents into your turn via `hookSpecificOutput.additionalContext`, which Claude Code shows as a system reminder. All queued completions between your last message and now deliver in one block.
 
-### v0.1 watcher limitations
+### Delivery timing
 
-- **Single-fire**: `asyncRewake` hooks fire once per session. After the watcher wakes Claude Code, the watcher is dead. **Re-arming requires a session restart.** If you want wake-on-completion for a *second* job in the same session, you'll need to quit and re-enter.
-- **No progress updates**: only terminal transitions wake the model. A job that's been running for an hour is silent until it finishes. If you need intermediate status, invoke `/acp-job-status <backend> <id>` manually.
+| Event | Telegram (instant) | In-session reminder |
+|---|---|---|
+| Job 1 finishes while you're typing | ✅ phone buzzes | queued |
+| Job 2 finishes while you're still typing | ✅ phone buzzes | queued |
+| You send any message to Claude | — | ✅ both reports delivered as one reminder |
+| Watcher daemon crashes | — | — |
+| You send next message | — | inject-pending.sh **respawns** the watcher automatically (self-healing) |
+
+Notifications never arrive "mid-turn" while Claude is already responding — that would be disruptive. Telegram is the real-time channel; the in-session path is eventual-consistent, delivered on your next turn boundary.
+
+### Limitations
+
+- **Injection latency = your next-message gap**: if a job finishes and you don't type anything to Claude for an hour, the in-session reminder is delayed by that hour. Telegram bridges the gap for AFK notifications.
+- **No progress updates**: only terminal transitions notify. A job that's been running for an hour is silent until it finishes. If you need intermediate status, invoke `/acp-job-status <backend> <id>` manually.
 
 ## Configuration
 
@@ -220,9 +243,10 @@ The Claude Code Telegram plugin runs one MCP server instance per Claude Code pro
   - `plugins/acp-bridge/commands/*.md` — the 12 slash command definitions
   - `plugins/acp-bridge/scripts/acp.sh` — shared argument parser and dispatcher for all commands
   - `plugins/acp-bridge/scripts/session-hook.sh` — SessionStart / SessionEnd handler (tracking + smart cleanup)
-  - `plugins/acp-bridge/scripts/job-watcher.sh` — long-lived background poller for asyncRewake notifications
-  - `plugins/acp-bridge/scripts/notify-telegram.sh` — Telegram Bot API helper
-  - `plugins/acp-bridge/hooks/hooks.json` — hook registration
+  - `plugins/acp-bridge/scripts/job-watcher.sh` — long-lived daemon poller that queues transition reports and fires Telegram
+  - `plugins/acp-bridge/scripts/inject-pending.sh` — UserPromptSubmit hook that drains queued reports into the model's context and self-heals the watcher
+  - `plugins/acp-bridge/scripts/notify-telegram.sh` — Telegram Bot API helper (HTML-formatted, plain-text-safe)
+  - `plugins/acp-bridge/hooks/hooks.json` — hook registration (SessionStart, UserPromptSubmit, SessionEnd)
 
 ## License
 
