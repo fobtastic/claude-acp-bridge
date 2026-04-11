@@ -1,0 +1,9 @@
+{
+  "name": "acp-bridge",
+  "version": "0.1.0",
+  "description": "Persistent ACP bridge for Gemini, Qwen, and Codex backends via ~/agent-extensions/acp-tool. Set ACP_TOOL_BIN to override the default path.",
+  "author": {
+    "name": "Chris Tou",
+    "email": "fobtastic.chris@gmail.com"
+  }
+}

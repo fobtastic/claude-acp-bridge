@@ -1,0 +1,21 @@
+{
+  "name": "claude-acp-bridge",
+  "owner": {
+    "name": "fobtastic"
+  },
+  "metadata": {
+    "description": "Personal Claude Code plugin: ACP bridge wrapper for Gemini, Qwen, and Codex",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "acp-bridge",
+      "description": "Persistent ACP bridge for Gemini, Qwen, and Codex via ~/agent-extensions/acp-tool",
+      "version": "0.1.0",
+      "author": {
+        "name": "Chris Tou"
+      },
+      "source": "./plugins/acp-bridge"
+    }
+  ]
+}
