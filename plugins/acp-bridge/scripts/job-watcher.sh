@@ -74,34 +74,44 @@ cleanup_and_exit() {
 }
 trap cleanup_and_exit TERM INT
 
-# snapshot_jobs: emit one line per (backend, job_id) pair in the format
-#   backend:job_id:status
-# plus one synthetic `backend:__probed__:ok` marker per backend whose
-# bridge responded. Backends with a down/errored bridge are absent from
-# the snapshot entirely.
+# snapshot_jobs: emit one tab-separated line per (backend, job_id) pair:
+#   backend \t job_id \t status \t prompt_summary
+# plus one synthetic `backend \t __probed__ \t ok \t` marker per backend
+# whose bridge responded. Backends with a down/errored bridge are absent
+# from the snapshot entirely.
 #
 # The __probed__ marker is load-bearing: the diff below only fires for
 # backends present in BOTH snapshots' probed set. Without it, a bridge
 # coming up mid-session (or an empty-baseline startup) would fire
 # discovery of every historical job as a "new" terminal transition.
+#
+# Tab is used as the delimiter because prompt text can contain colons
+# and other ASCII punctuation but is unlikely to contain tabs (and we
+# strip any that sneak through in the parser).
 snapshot_jobs() {
   local b output
   for b in "${BACKENDS[@]}"; do
-    # timeout guards against a hung bridge socket freezing the loop.
     output=$(timeout 10 "$ACP_CLIENT_BIN" --workspace "$ACP_WORKSPACE" --backend "$b" jobs 2>/dev/null || true)
     [ -z "$output" ] && continue
-    echo "${b}:__probed__:ok"
+    printf '%s\t__probed__\tok\t\n' "$b"
     BACKEND="$b" python3 -c '
 import os, sys
 backend = os.environ["BACKEND"]
+# Columns from `acp-client jobs`: JOB_ID STATUS CREATED_AT PROMPT...
+# `split(maxsplit=3)` keeps the prompt (which may contain spaces) intact.
 for line in sys.stdin:
-    parts = line.split()
+    parts = line.rstrip("\n").split(maxsplit=3)
     if len(parts) < 2:
         continue
     job_id, status = parts[0], parts[1]
     if not job_id.startswith("job_"):
         continue
-    print(f"{backend}:{job_id}:{status.lower()}")
+    prompt = parts[3] if len(parts) >= 4 else ""
+    # Sanitize: strip tabs (our field separator) and collapse whitespace.
+    prompt = " ".join(prompt.replace("\t", " ").split())
+    if len(prompt) > 80:
+        prompt = prompt[:77] + "..."
+    print(f"{backend}\t{job_id}\t{status.lower()}\t{prompt}")
 ' <<<"$output"
   done | sort -u
 }
@@ -121,22 +131,24 @@ import os
 TERMINAL = {"completed", "succeeded", "failed", "error", "cancelled", "canceled", "done"}
 
 def parse(path):
+    # Returns (jobs, probed) where jobs maps (backend, job_id) -> (status, prompt).
     jobs = {}
     probed = set()
     try:
         with open(path) as f:
             for line in f:
-                line = line.strip()
+                line = line.rstrip("\n")
                 if not line:
                     continue
-                parts = line.split(":", 2)
-                if len(parts) != 3:
+                parts = line.split("\t")
+                if len(parts) < 3:
                     continue
-                backend, key, status = parts
+                backend, key, status = parts[0], parts[1], parts[2]
+                prompt = parts[3] if len(parts) >= 4 else ""
                 if key == "__probed__":
                     probed.add(backend)
                 else:
-                    jobs[(backend, key)] = status
+                    jobs[(backend, key)] = (status, prompt)
     except FileNotFoundError:
         pass
     return jobs, probed
@@ -145,23 +157,28 @@ last_jobs, last_probed = parse(os.environ["LAST_FILE"])
 curr_jobs, _ = parse(os.environ["CURR_FILE"])
 
 transitions = []
-for (backend, job_id), curr_status in curr_jobs.items():
+for (backend, job_id), (curr_status, prompt) in curr_jobs.items():
     # Suppress first-observation fires — a backend must have been
     # probed in the PREVIOUS snapshot for its transitions to count.
     if backend not in last_probed:
         continue
     if curr_status not in TERMINAL:
         continue
-    if last_jobs.get((backend, job_id)) != curr_status:
-        transitions.append((backend, job_id, curr_status))
+    last_entry = last_jobs.get((backend, job_id))
+    last_status = last_entry[0] if last_entry else None
+    if last_status != curr_status:
+        transitions.append((backend, job_id, curr_status, prompt))
 
 if transitions:
     lines = ["Detected ACP job status changes:", ""]
-    for b, jid, s in transitions:
+    for b, jid, s, prompt in transitions:
         mark = "✓" if s in ("completed", "succeeded", "done") else "✗"
-        lines.append(f"  {mark} {b} job {jid}: {s}")
-    lines.append("")
-    lines.append("Run /acp-follow <backend> <job-id> to see the full output.")
+        # Show prompt text as the primary identifier; keep job id in parens
+        # so /acp-follow has something to grab. Fall back to bare status
+        # if no prompt was captured (shouldn't happen in practice).
+        label = f'"{prompt}"' if prompt else s
+        lines.append(f"  {mark} {b}: {label}")
+        lines.append(f"      /acp-follow {b} {jid}")
     print("\n".join(lines))
 PY
 )
