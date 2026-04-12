@@ -170,16 +170,48 @@ for (backend, job_id), (curr_status, prompt) in curr_jobs.items():
         transitions.append((backend, job_id, curr_status, prompt))
 
 if transitions:
-    lines = ["Detected ACP job status changes:", ""]
+    import re
+
+    def summarize_prompt(text: str, max_len: int = 60) -> str:
+        """Turn a raw prompt into a concise task summary.
+
+        Strips filler prefixes like 'You are performing a...' or
+        'Please ...' so the notification reads as an outcome
+        description, not a raw echo of the input.
+        """
+        if not text:
+            return ""
+        # Collapse newlines/tabs to spaces (prompts can be multi-line).
+        text = " ".join(text.split())
+        # Strip common instruction-style prefixes.
+        text = re.sub(
+            r"^(You are (performing |doing |implementing |conducting )?|"
+            r"Please |I want you to |I need you to |I'd like you to )",
+            "", text, count=1, flags=re.IGNORECASE,
+        ).strip()
+        # Strip leading articles for cleaner reading after "completed: ".
+        text = re.sub(r"^(a |an |the )", "", text, count=1, flags=re.IGNORECASE)
+        # Lowercase the first char (reads better after "completed: ...")
+        if text and text[0].isupper():
+            text = text[0].lower() + text[1:]
+        if len(text) > max_len:
+            text = text[: max_len - 3].rstrip() + "..."
+        return text
+
+    lines = []
     for b, jid, s, prompt in transitions:
-        mark = "✓" if s in ("completed", "succeeded", "done") else "✗"
-        # Show prompt text as the primary identifier; keep job id in parens
-        # so /acp-follow has something to grab. Fall back to bare status
-        # if no prompt was captured (shouldn't happen in practice).
-        label = f'"{prompt}"' if prompt else s
-        lines.append(f"  {mark} {b}: {label}")
-        lines.append(f"      /acp-follow {b} {jid}")
-    print("\n".join(lines))
+        summary = summarize_prompt(prompt)
+        if s in ("completed", "succeeded", "done"):
+            lines.append(f"✓ {b} completed: {summary}" if summary else f"✓ {b} completed")
+        elif s in ("failed", "error"):
+            lines.append(f"✗ {b} failed: {summary}" if summary else f"✗ {b} failed")
+        elif s in ("cancelled", "canceled"):
+            lines.append(f"⊘ {b} cancelled: {summary}" if summary else f"⊘ {b} cancelled")
+        else:
+            lines.append(f"  {b} {s}: {summary}" if summary else f"  {b} {s}")
+        lines.append(f"  /acp-follow {b} {jid}")
+        lines.append("")
+    print("\n".join(lines).rstrip())
 PY
 )
 
