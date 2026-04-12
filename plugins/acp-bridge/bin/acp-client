@@ -1407,32 +1407,9 @@ async def prompt_via_socket(
                 print(line.decode(errors="replace"), end="")
                 continue
 
-            kind = event.get("type")
-            if kind == "chunk":
-                text = event.get("text", "")
-                if plain:
-                    print(text, end="", flush=True)
-                else:
-                    print(json.dumps(event, ensure_ascii=False))
-            elif kind == "tool_call":
-                print(f"\n[tool] {event.get('title') or event.get('toolCallId')}", file=sys.stderr)
-            elif kind == "tool_update":
-                print(f"\n[tool:{event.get('status')}] {event.get('title') or event.get('toolCallId')}", file=sys.stderr)
-            elif kind == "usage":
-                print(f"\n[usage] {json.dumps(event.get('data'), ensure_ascii=False)}", file=sys.stderr)
-            elif kind == "terminal_output":
-                stream_name = event.get("stream", "terminal")
-                text = event.get("text", "")
-                print(f"\n[terminal:{stream_name}] {text}", end="", file=sys.stderr, flush=True)
-            elif kind == "event":
-                print(f"\n[event] {json.dumps(event.get('data'), ensure_ascii=False)}", file=sys.stderr)
-            elif kind == "done":
-                if not plain:
-                    print(json.dumps(event, ensure_ascii=False))
-                return 0
-            elif kind == "error":
-                print(event.get("message", "Unknown bridge error"), file=sys.stderr)
-                return 1
+            result = _print_event(event, plain)
+            if result is not None:
+                return result
         return 0
     finally:
         writer.close()
@@ -1878,6 +1855,37 @@ async def resolve_prompt_session(
     return session_mode, session_id
 
 
+def _print_event(event: dict[str, Any], plain: bool) -> Optional[int]:
+    """Print a single bridge event to stdout/stderr. Returns exit code on terminal events."""
+    kind = event.get("type")
+    if kind == "chunk":
+        text = event.get("text", "")
+        if plain:
+            print(text, end="", flush=True)
+        else:
+            print(json.dumps(event, ensure_ascii=False))
+    elif kind == "tool_call":
+        print(f"\n[tool] {event.get('title') or event.get('toolCallId')}", file=sys.stderr)
+    elif kind == "tool_update":
+        print(f"\n[tool:{event.get('status')}] {event.get('title') or event.get('toolCallId')}", file=sys.stderr)
+    elif kind == "usage":
+        print(f"\n[usage] {json.dumps(event.get('data'), ensure_ascii=False)}", file=sys.stderr)
+    elif kind == "terminal_output":
+        stream_name = event.get("stream", "terminal")
+        text = event.get("text", "")
+        print(f"\n[terminal:{stream_name}] {text}", end="", file=sys.stderr, flush=True)
+    elif kind == "event":
+        print(f"\n[event] {json.dumps(event.get('data'), ensure_ascii=False)}", file=sys.stderr)
+    elif kind == "done":
+        if not plain:
+            print(json.dumps(event, ensure_ascii=False))
+        return 0
+    elif kind == "error":
+        print(event.get("message", "Unknown bridge error"), file=sys.stderr)
+        return 1
+    return None
+
+
 def format_jobs_table(jobs: list[dict[str, Any]]) -> str:
     if not jobs:
         return "No jobs found."
@@ -1898,28 +1906,9 @@ async def follow_job(socket_path: Path, job_id: str, *, plain: bool = True, poll
         events = result.get("events") or []
         new_offset = int(result.get("nextOffset") or offset)
         for event in events:
-            kind = event.get("type")
-            if kind == "chunk":
-                text = event.get("text", "")
-                if plain:
-                    print(text, end="", flush=True)
-                else:
-                    print(json.dumps(event, ensure_ascii=False))
-            elif kind == "tool_call":
-                print(f"\n[tool] {event.get('title') or event.get('toolCallId')}", file=sys.stderr)
-            elif kind == "tool_update":
-                print(f"\n[tool:{event.get('status')}] {event.get('title') or event.get('toolCallId')}", file=sys.stderr)
-            elif kind == "usage":
-                print(f"\n[usage] {json.dumps(event.get('data'), ensure_ascii=False)}", file=sys.stderr)
-            elif kind == "terminal_output":
-                stream_name = event.get("stream", "terminal")
-                text = event.get("text", "")
-                print(f"\n[terminal:{stream_name}] {text}", end="", file=sys.stderr, flush=True)
-            elif kind == "event":
-                print(f"\n[event] {json.dumps(event.get('data'), ensure_ascii=False)}", file=sys.stderr)
-            elif kind == "error":
-                print(event.get("message", "Unknown bridge error"), file=sys.stderr)
-                return 1
+            result = _print_event(event, plain)
+            if result is not None:
+                return result
 
         if new_offset > offset:
             offset = new_offset
