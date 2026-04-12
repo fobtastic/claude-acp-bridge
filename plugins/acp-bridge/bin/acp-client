@@ -846,7 +846,7 @@ def get_backend_spec(name: str) -> BackendSpec:
 
 
 def get_runtime_paths(backend: str) -> RuntimePaths:
-    root = Path.home() / ".cache" / "remote-hunter" / "acp-bridge" / backend
+    root = Path.home() / ".cache" / "claude-acp-bridge" / "bridges" / backend
     return RuntimePaths(
         socket=root / f"{backend}.sock",
         log=root / "bridge.log",
