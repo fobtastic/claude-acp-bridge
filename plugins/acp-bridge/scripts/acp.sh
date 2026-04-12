@@ -75,13 +75,13 @@ run_info_command() {
     for b in "${BACKENDS[@]}"; do
       echo "## $b"
       track_invocation "$b"
-      "$ACP_CLIENT_BIN" --backend "$b" "$sub" || true
+      "$ACP_CLIENT_BIN" --workspace "$ACP_WORKSPACE" --backend "$b" "$sub" || true
       echo
     done
   else
     is_valid_backend "$ARGS" || invalid_backend_exit "$ARGS"
     track_invocation "$ARGS"
-    "$ACP_CLIENT_BIN" --backend "$ARGS" "$sub"
+    "$ACP_CLIENT_BIN" --workspace "$ACP_WORKSPACE" --backend "$ARGS" "$sub"
   fi
 }
 
@@ -94,7 +94,7 @@ run_backend_only_command() {
   fi
   is_valid_backend "$ARGS" || invalid_backend_exit "$ARGS"
   track_invocation "$ARGS"
-  "$ACP_CLIENT_BIN" --backend "$ARGS" "$sub"
+  "$ACP_CLIENT_BIN" --workspace "$ACP_WORKSPACE" --backend "$ARGS" "$sub"
 }
 
 run_backend_and_text_command() {
@@ -109,7 +109,7 @@ run_backend_and_text_command() {
   fi
   is_valid_backend "$BACKEND" || invalid_backend_exit "$BACKEND"
   track_invocation "$BACKEND"
-  "$ACP_CLIENT_BIN" --backend "$BACKEND" "$sub" "$TEXT"
+  "$ACP_CLIENT_BIN" --workspace "$ACP_WORKSPACE" --backend "$BACKEND" "$sub" "$TEXT"
 }
 
 case "$SUBCOMMAND" in

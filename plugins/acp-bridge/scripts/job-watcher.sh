@@ -88,7 +88,7 @@ snapshot_jobs() {
   local b output
   for b in "${BACKENDS[@]}"; do
     # timeout guards against a hung bridge socket freezing the loop.
-    output=$(timeout 10 "$ACP_CLIENT_BIN" --backend "$b" jobs 2>/dev/null || true)
+    output=$(timeout 10 "$ACP_CLIENT_BIN" --workspace "$ACP_WORKSPACE" --backend "$b" jobs 2>/dev/null || true)
     [ -z "$output" ] && continue
     echo "${b}:__probed__:ok"
     BACKEND="$b" python3 -c '

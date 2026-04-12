@@ -17,6 +17,14 @@ ACP_CLIENT_BIN="${ACP_CLIENT_BIN:-$DEFAULT_ACP_CLIENT_BIN}"
 # by session id + a documented suffix set.
 STATE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/claude-acp-bridge/sessions"
 
+# Workspace the ACP client should use for prompt/submit/resume/new/pick
+# requests (the "project" the backend is working on). Callers can override
+# with $ACP_WORKSPACE — useful when dispatching a job from one repo to a
+# backend that should operate on a different repo. Default: $PWD, which
+# for scripts invoked as Claude Code hooks is the Claude Code session's
+# working directory (the user's current project).
+ACP_WORKSPACE="${ACP_WORKSPACE:-$PWD}"
+
 # Canonical backend list. Order drives iteration in snapshot_jobs and
 # /acp-status fan-outs. Adding a backend means editing this one line.
 BACKENDS=(gemini qwen codex)

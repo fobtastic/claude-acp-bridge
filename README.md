@@ -194,6 +194,7 @@ All configuration is via environment variables. Set them in your shell profile o
 | Variable | Default | Purpose |
 |---|---|---|
 | `ACP_CLIENT_BIN` | `<plugin>/bin/acp-client` | Path to the ACP client binary. Defaults to the bundled client; override only if you want to point at a different implementation. |
+| `ACP_WORKSPACE` | `$PWD` (caller's cwd) | Workspace root the backend should operate on. Default is the current Claude Code session's working directory. Override when you want to dispatch work from one repo to a backend that should act on a different repo — e.g. `ACP_WORKSPACE=/path/to/other/repo /acp-submit qwen "..."`. The bridge updates its `workspaceRoot` on every prompt/submit/resume/new/pick request, so you can target different workspaces across successive invocations. |
 | `ACP_BRIDGE_WATCH_INTERVAL` | `30` | Watcher poll interval in seconds |
 | `ACP_BRIDGE_TELEGRAM_CHAT_ID` | *(unset)* | If set, watcher posts job-completion messages to this Telegram chat ID |
 | `TELEGRAM_BOT_TOKEN` | *(auto)* | Telegram bot token. If unset, read from `~/.claude/channels/telegram/.env` (reuses the Claude Code Telegram plugin's bot) |

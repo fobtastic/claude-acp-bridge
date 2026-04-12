@@ -62,7 +62,7 @@ case "$ACTION" in
     while IFS= read -r backend; do
       [ -z "$backend" ] && continue
 
-      status_json=$("$ACP_CLIENT_BIN" --backend "$backend" status 2>/dev/null || echo "{}")
+      status_json=$("$ACP_CLIENT_BIN" --workspace "$ACP_WORKSPACE" --backend "$backend" status 2>/dev/null || echo "{}")
       active_jobs=$(python3 -c '
 import json, sys
 try:
@@ -75,7 +75,7 @@ except Exception:
       if [ "$active_jobs" -gt 0 ]; then
         echo "acp-bridge: skipping ${backend} — ${active_jobs} active jobs" >&2
       else
-        "$ACP_CLIENT_BIN" --backend "$backend" close >/dev/null 2>&1 || true
+        "$ACP_CLIENT_BIN" --workspace "$ACP_WORKSPACE" --backend "$backend" close >/dev/null 2>&1 || true
         echo "acp-bridge: closed idle ${backend}" >&2
       fi
     done < <(sort -u "$SESSION_LIST_FILE")
