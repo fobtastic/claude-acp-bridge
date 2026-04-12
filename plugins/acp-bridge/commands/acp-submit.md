@@ -6,4 +6,4 @@ allowed-tools: Bash
 
 !`"${CLAUDE_PLUGIN_ROOT}/scripts/acp.sh" submit "$ARGUMENTS"`
 
-Present the bridge response verbatim. Note the returned job ID — it can be inspected with `/acp-job-status` or streamed with `/acp-follow`.
+Present the bridge response verbatim. Note the returned task ID — existing job commands still work, and the task can also be inspected with `/acp-task`, followed with `/acp-follow`, or canceled with `/acp-cancel`.

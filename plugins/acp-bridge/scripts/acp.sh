@@ -129,7 +129,7 @@ if [[ "$ARGS" == --json* ]]; then
 fi
 
 case "$SUBCOMMAND" in
-  status|sessions|jobs|permissions)
+  status|sessions|jobs|tasks|permissions)
     run_info_command "$SUBCOMMAND"
     ;;
   policy)
@@ -141,8 +141,8 @@ case "$SUBCOMMAND" in
   prompt|resume|pick|new|submit)
     run_backend_and_text_command "$SUBCOMMAND" "<text>"
     ;;
-  job-status|follow)
-    run_backend_and_text_command "$SUBCOMMAND" "<job-id>"
+  job-status|follow|task|watch|cancel)
+    run_backend_and_text_command "$SUBCOMMAND" "<task-id>"
     ;;
   approve|deny)
     run_backend_and_text_command "$SUBCOMMAND" "<request-id> [--session|--always]"

@@ -74,8 +74,8 @@ cleanup_and_exit() {
 }
 trap cleanup_and_exit TERM INT
 
-# snapshot_jobs: emit one tab-separated line per (backend, job_id) pair:
-#   backend \t job_id \t status \t prompt_summary
+# snapshot_jobs: emit one tab-separated line per (backend, task_id) pair:
+#   backend \t task_id \t state \t status_message
 # plus one synthetic `backend \t __probed__ \t ok \t` marker per backend
 # whose bridge responded. Backends with a down/errored bridge are absent
 # from the snapshot entirely.
@@ -91,27 +91,28 @@ trap cleanup_and_exit TERM INT
 snapshot_jobs() {
   local b output
   for b in "${BACKENDS[@]}"; do
-    output=$(timeout 10 "$ACP_CLIENT_BIN" --workspace "$ACP_WORKSPACE" --backend "$b" jobs 2>/dev/null || true)
+    output=$(timeout 10 "$ACP_CLIENT_BIN" --no-plain --workspace "$ACP_WORKSPACE" --backend "$b" jobs 2>/dev/null || true)
     [ -z "$output" ] && continue
     printf '%s\t__probed__\tok\t\n' "$b"
     BACKEND="$b" python3 -c '
+import json
 import os, sys
 backend = os.environ["BACKEND"]
-# Columns from `acp-client jobs`: JOB_ID STATUS CREATED_AT PROMPT...
-# `split(maxsplit=3)` keeps the prompt (which may contain spaces) intact.
-for line in sys.stdin:
-    parts = line.rstrip("\n").split(maxsplit=3)
-    if len(parts) < 2:
+try:
+    data = json.loads(sys.stdin.read() or "{}")
+except Exception:
+    data = {}
+for task in data.get("tasks") or []:
+    task_id = str(task.get("id") or "")
+    if not task_id.startswith("job_"):
         continue
-    job_id, status = parts[0], parts[1]
-    if not job_id.startswith("job_"):
-        continue
-    prompt = parts[3] if len(parts) >= 4 else ""
-    # Sanitize: strip tabs (our field separator) and collapse whitespace.
-    prompt = " ".join(prompt.replace("\t", " ").split())
-    if len(prompt) > 80:
-        prompt = prompt[:77] + "..."
-    print(f"{backend}\t{job_id}\t{status.lower()}\t{prompt}")
+    status = task.get("status") if isinstance(task.get("status"), dict) else {}
+    state = str(status.get("state") or "unknown").lower()
+    message = status.get("message") or task.get("prompt") or ""
+    message = " ".join(str(message).replace("\t", " ").split())
+    if len(message) > 80:
+        message = message[:77] + "..."
+    print(f"{backend}\t{task_id}\t{state}\t{message}")
 ' <<<"$output"
   done | sort -u
 }
@@ -156,10 +157,11 @@ os.replace(health_file + ".tmp", health_file)
   report=$(LAST_FILE="$SESSION_LASTJOBS_FILE" CURR_FILE="$TMP_CURRENT" ACP_CLIENT_BIN="$ACP_CLIENT_BIN" ACP_WORKSPACE="$ACP_WORKSPACE" python3 <<'PY'
 import os
 
-TERMINAL = {"completed", "succeeded", "failed", "error", "cancelled", "canceled", "done"}
+TERMINAL = {"completed", "failed", "canceled", "rejected"}
+INTERRUPTED = {"input_required", "auth_required"}
 
 def parse(path):
-    # Returns (jobs, probed) where jobs maps (backend, job_id) -> (status, prompt).
+    # Returns (tasks, probed) where tasks maps (backend, task_id) -> (state, message).
     jobs = {}
     probed = set()
     try:
@@ -190,7 +192,7 @@ for (backend, job_id), (curr_status, prompt) in curr_jobs.items():
     # probed in the PREVIOUS snapshot for its transitions to count.
     if backend not in last_probed:
         continue
-    if curr_status not in TERMINAL:
+    if curr_status not in TERMINAL and curr_status not in INTERRUPTED:
         continue
     last_entry = last_jobs.get((backend, job_id))
     last_status = last_entry[0] if last_entry else None
@@ -199,9 +201,18 @@ for (backend, job_id), (curr_status, prompt) in curr_jobs.items():
 
 if transitions:
     import re, subprocess as sp, json
+    from pathlib import Path
+
+    import sys
 
     acp_client = os.environ.get("ACP_CLIENT_BIN", "")
     acp_workspace = os.environ.get("ACP_WORKSPACE", ".")
+    if acp_client:
+        sys.path.insert(0, str(Path(acp_client).resolve().parent))
+    try:
+        from acp_task_store import append_task_event, load_task, save_task, task_lock
+    except Exception:
+        append_task_event = load_task = save_task = task_lock = None
 
     def get_job_details(backend: str, job_id: str) -> dict:
         """Query job-status for elapsed time and event count."""
@@ -209,7 +220,7 @@ if transitions:
             return {}
         try:
             out = sp.run(
-                [acp_client, "--workspace", acp_workspace, "--backend", backend, "job-status", job_id],
+                [acp_client, "--no-plain", "--workspace", acp_workspace, "--backend", backend, "job-status", job_id],
                 capture_output=True, text=True, timeout=10,
             )
             if out.returncode == 0 and out.stdout.strip():
@@ -244,12 +255,25 @@ if transitions:
 
     lines = []
     for b, jid, s, prompt in transitions:
+        if append_task_event and load_task and save_task and task_lock:
+            try:
+                with task_lock(b):
+                    task = load_task(b, jid)
+                    if task:
+                        event = append_task_event(task, "task.notification_queued", {"state": s, "channel": "claude-session"})
+                        task.setdefault("metadata", {})["lastNotifiedEventId"] = event["eventId"]
+                        if os.environ.get("ACP_BRIDGE_TELEGRAM_CHAT_ID"):
+                            sent = append_task_event(task, "task.notification_sent", {"state": s, "channel": "telegram", "delivery": "attempted"})
+                            task.setdefault("metadata", {})["lastTelegramNotificationEventId"] = sent["eventId"]
+                        save_task(task)
+            except Exception:
+                pass
         details = get_job_details(b, jid)
         summary = summarize_prompt(prompt)
         elapsed_str = ""
         events_str = ""
-        if details.get("startedAt") and details.get("completedAt"):
-            elapsed_str = f" in {format_elapsed(details['startedAt'], details['completedAt'])}"
+        if details.get("createdAt") and details.get("completedAt"):
+            elapsed_str = f" in {format_elapsed(details['createdAt'], details['completedAt'])}"
         event_count = details.get("eventCount")
         if event_count:
             events_str = f" ({event_count} events)"
@@ -261,9 +285,14 @@ if transitions:
             lines.append(f"✗ {b} failed{meta}: {summary}" if summary else f"✗ {b} failed{meta}")
         elif s in ("cancelled", "canceled"):
             lines.append(f"⊘ {b} cancelled{meta}: {summary}" if summary else f"⊘ {b} cancelled{meta}")
+        elif s == "input_required":
+            lines.append(f"! {b} input required{meta}: {summary}" if summary else f"! {b} input required{meta}")
+        elif s == "auth_required":
+            lines.append(f"! {b} auth required{meta}: {summary}" if summary else f"! {b} auth required{meta}")
         else:
             lines.append(f"  {b} {s}{meta}: {summary}" if summary else f"  {b} {s}{meta}")
         lines.append(f"  /acp-follow {b} {jid}")
+        lines.append(f"  /acp-task {b} {jid}")
         lines.append("")
     print("\n".join(lines).rstrip())
 PY

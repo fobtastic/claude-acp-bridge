@@ -39,6 +39,23 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
+from acp_task_store import (
+    append_history,
+    append_task_event,
+    compact_task,
+    is_terminal_state,
+    list_tasks as store_list_tasks,
+    load_task,
+    load_task_events,
+    new_task,
+    normalize_task_state,
+    save_task,
+    task_events_path,
+    task_lock,
+    update_task_status,
+    upsert_artifact,
+)
+
 DEFAULT_WORKSPACE = Path.cwd()
 DEFAULT_OUTPUT_BYTE_LIMIT = 1_048_576
 SOCKET_STREAM_LIMIT = 8 * 1024 * 1024  # 8MB - large enough for full job payloads
@@ -266,7 +283,7 @@ class PromptJob:
         )
         job.events = list(record.get("events") or [])
         job.next_event_id = int(record.get("nextEventId") or len(job.events))
-        if record.get("done") or job.status in {"completed", "failed", "interrupted"}:
+        if record.get("done") or job.status in {"completed", "failed", "interrupted", "cancelled", "canceled"}:
             job.done_event.set()
         return job
 
@@ -752,6 +769,25 @@ class ACPBridge:
         }
 
         self._pending_permissions[request_id] = (future, perm_request)
+        if self._current_job_id:
+            try:
+                with task_lock(backend):
+                    task = load_task(backend, self._current_job_id)
+                    if task:
+                        metadata = task.setdefault("metadata", {})
+                        pending = metadata.setdefault("pendingPermissions", {})
+                        pending[request_id] = _safe_metadata(perm_request)
+                        update_task_status(
+                            task,
+                            "input_required",
+                            perm_request["description"],
+                            event_type="task.permission_requested",
+                            payload=_safe_metadata(perm_request),
+                        )
+                        save_task(task)
+            except Exception as exc:
+                sys.stderr.write(f"[task-permission-event-error] {exc}\n")
+                sys.stderr.flush()
 
         # Derive the Claude Code session ID from the environment variable set by
         # session-hook.sh. It points to STATE_DIR/<session_id>.list.
@@ -769,6 +805,21 @@ class ACPBridge:
             return await asyncio.wait_for(future, timeout=1800)
         except asyncio.TimeoutError:
             self._pending_permissions.pop(request_id, None)
+            if self._current_job_id:
+                try:
+                    with task_lock(backend):
+                        task = load_task(backend, self._current_job_id)
+                        if task:
+                            update_task_status(
+                                task,
+                                "working",
+                                "Permission request timed out; backend received cancellation",
+                                event_type="task.permission_resolved",
+                                payload={"requestId": request_id, "decision": "timeout"},
+                            )
+                            save_task(task)
+                except Exception:
+                    pass
             return {"outcome": {"outcome": "cancelled"}}
 
     def _extract_action_info(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -1003,6 +1054,11 @@ def save_job(runtime_paths: RuntimePaths, job: PromptJob) -> None:
     ensure_private_file(tmp)
     tmp.replace(path)
     ensure_private_file(path)
+    try:
+        sync_task_from_job(job)
+    except Exception as exc:
+        sys.stderr.write(f"[task-sync-error] {exc}\n")
+        sys.stderr.flush()
 
 
 def load_jobs(runtime_paths: RuntimePaths) -> dict[str, PromptJob]:
@@ -1023,10 +1079,147 @@ def load_jobs(runtime_paths: RuntimePaths) -> dict[str, PromptJob]:
                 job.error = job.error or "Bridge restarted before job completion"
                 job.completed_at = time.time()
                 job.done_event.set()
+                save_job(runtime_paths, job)
             jobs[job.job_id] = job
         except Exception:
             continue
     return jobs
+
+
+def _task_message_from_job(job: PromptJob) -> str:
+    if job.error:
+        return job.error
+    return {
+        "queued": "Task accepted by bridge",
+        "running": "Backend is processing",
+        "completed": "Task completed",
+        "failed": "Task failed",
+        "interrupted": "Bridge restarted before job completion",
+    }.get(job.status, "Task state could not be determined")
+
+
+def _safe_metadata(value: Any) -> Any:
+    if isinstance(value, dict):
+        sanitized: dict[str, Any] = {}
+        for key, item in value.items():
+            lower = str(key).lower()
+            if any(marker in lower for marker in ("token", "secret", "password", "apikey", "api_key", "authorization")):
+                sanitized[str(key)] = "[redacted]"
+            elif lower == "raw":
+                continue
+            else:
+                sanitized[str(key)] = _safe_metadata(item)
+        return sanitized
+    if isinstance(value, list):
+        return [_safe_metadata(item) for item in value]
+    return value
+
+
+def task_from_job(job: PromptJob, existing: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    state = normalize_task_state(job.status)
+    metadata = dict(existing.get("metadata") or {}) if existing else {}
+    metadata.update(
+        {
+            "jobId": job.job_id,
+            "sessionMode": job.session_mode,
+            "sessionId": job.session_id,
+            "backendJobStatus": job.status,
+        }
+    )
+    task = existing or new_task(
+        task_id=job.job_id,
+        backend=job.backend,
+        prompt=job.prompt,
+        workspace_root=job.workspace_root,
+        context_id=job.session_id or job.workspace_root,
+        status=state,
+        created_at=job.created_at,
+        metadata=metadata,
+    )
+    task["schemaVersion"] = 1
+    task["id"] = job.job_id
+    task["backend"] = job.backend
+    task["contextId"] = job.session_id or job.workspace_root
+    task["workspaceRoot"] = job.workspace_root
+    task["prompt"] = job.prompt
+    task["createdAt"] = job.created_at
+    task["updatedAt"] = max(float(task.get("updatedAt") or 0), float(job.updated_at or job.created_at))
+    task["completedAt"] = job.completed_at
+    task["metadata"] = metadata
+    if not task.get("history"):
+        append_history(task, "user", job.prompt, timestamp=job.created_at)
+    update_task_status(task, state, _task_message_from_job(job), timestamp=job.updated_at)
+    job_record_path = str(get_job_path(get_runtime_paths(job.backend), job.job_id))
+    event_log_path = str(task_events_path(job.backend, job.job_id))
+    for artifact_spec in (
+        {
+            "id": "backend_job_record",
+            "type": "raw_backend_record",
+            "title": "Backend job record",
+            "path": job_record_path,
+        },
+        {
+            "id": "task_event_log",
+            "type": "event_log",
+            "title": "Task event log",
+            "path": event_log_path,
+        },
+    ):
+        artifact, created, changed = upsert_artifact(task, artifact_spec)
+        if changed:
+            append_task_event(
+                task,
+                "task.artifact_created" if created else "task.artifact_updated",
+                {"artifactId": artifact["id"], "type": artifact["type"], "title": artifact["title"]},
+            )
+    if job.result is not None:
+        artifact, created, changed = upsert_artifact(
+            task,
+            {
+                "id": "final_response",
+                "type": "final_response",
+                "title": "Final response",
+                "data": job.result,
+            },
+        )
+        if changed:
+            append_task_event(
+                task,
+                "task.artifact_created" if created else "task.artifact_updated",
+                {"artifactId": artifact["id"], "type": artifact["type"], "title": artifact["title"]},
+            )
+    if job.error:
+        artifact, created, changed = upsert_artifact(
+            task,
+            {
+                "id": "error_log",
+                "type": "error_log",
+                "title": "Error log",
+                "text": job.error,
+            },
+        )
+        if changed:
+            append_task_event(
+                task,
+                "task.artifact_created" if created else "task.artifact_updated",
+                {"artifactId": artifact["id"], "type": artifact["type"], "title": artifact["title"]},
+            )
+    return task
+
+
+def sync_task_from_job(job: PromptJob, *, event_type: Optional[str] = None, payload: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    with task_lock(job.backend):
+        existing = load_task(job.backend, job.job_id)
+        task = task_from_job(job, existing)
+        if event_type:
+            append_task_event(task, event_type, payload or {})
+        save_task(task)
+        return task
+
+
+def task_summary_from_job(job: PromptJob) -> dict[str, Any]:
+    task = sync_task_from_job(job)
+    return compact_task(task, history_limit=10)
 
 
 def ensure_private_dir(path: Path) -> None:
@@ -1428,25 +1621,34 @@ async def run_server(backend: str, socket_path: Path, workspace_root: Path) -> N
 
     async def append_job_event(job: PromptJob, event: JsonValue) -> None:
         job.append_event(event)
+        task_event_type: Optional[str] = None
+        task_event_payload: dict[str, Any] = {"backendEventType": event.get("type")}
         if event.get("type") == "done":
             job.status = "completed"
             job.result = event.get("result") if isinstance(event.get("result"), dict) else {"value": event.get("result")}
             job.completed_at = time.time()
             job.done_event.set()
+            task_event_type = "task.completed"
+            task_event_payload["result"] = job.result
             notify_job_completion(job)
         elif event.get("type") == "error":
             job.status = "failed"
             job.error = str(event.get("message", "Unknown bridge error"))
             job.completed_at = time.time()
             job.done_event.set()
+            task_event_type = "task.failed"
+            task_event_payload["message"] = job.error
             notify_job_completion(job)
         save_job(runtime_paths, job)
+        if task_event_type:
+            sync_task_from_job(job, event_type=task_event_type, payload=task_event_payload)
 
     async def execute_job(job: PromptJob) -> None:
         job.status = "running"
         job.started_at = time.time()
         job.updated_at = time.time()
         save_job(runtime_paths, job)
+        sync_task_from_job(job, event_type="task.started", payload={"startedAt": job.started_at})
 
         async def record(event: JsonValue) -> None:
             await append_job_event(job, event)
@@ -1466,6 +1668,7 @@ async def run_server(backend: str, socket_path: Path, workspace_root: Path) -> N
                 job.done_event.set()
                 notify_job_completion(job)
                 save_job(runtime_paths, job)
+                sync_task_from_job(job, event_type="task.completed", payload={"result": job.result})
         except Exception as exc:
             await append_job_event(job, {"type": "error", "message": str(exc)})
         finally:
@@ -1491,6 +1694,10 @@ async def run_server(backend: str, socket_path: Path, workspace_root: Path) -> N
                 return
 
             if action == "close":
+                active_tasks = [task for task in store_list_tasks(backend=bridge.backend, active_only=True)]
+                if active_tasks:
+                    await emit({"type": "error", "message": f"Refusing to close {bridge.backend}: {len(active_tasks)} active task(s)"})
+                    return
                 await bridge.shutdown()
                 await emit({"type": "done", "result": {"closed": True}})
                 stop_event.set()
@@ -1506,6 +1713,7 @@ async def run_server(backend: str, socket_path: Path, workspace_root: Path) -> N
                             "sessionId": bridge.session_id,
                             "workspaceRoot": str(bridge.workspace_root),
                             "activeJobs": len([job for job in jobs.values() if not job.done_event.is_set()]),
+                            "activeTasks": len(store_list_tasks(backend=bridge.backend, active_only=True)),
                         },
                     }
                 )
@@ -1522,8 +1730,24 @@ async def run_server(backend: str, socket_path: Path, workspace_root: Path) -> N
                 return
 
             if action == "list_jobs":
-                job_items = sorted((job.snapshot() for job in jobs.values()), key=lambda item: item.get("createdAt", 0), reverse=True)
+                job_items = sorted((job.snapshot() for job in jobs.values()), key=lambda item: item.get("updatedAt", 0), reverse=True)
                 await emit({"type": "done", "result": {"jobs": job_items}})
+                return
+
+            if action == "list_tasks":
+                for job in jobs.values():
+                    sync_task_from_job(job)
+                filters = request.get("filters") if isinstance(request.get("filters"), dict) else {}
+                tasks = store_list_tasks(
+                    backend=bridge.backend,
+                    context_id=filters.get("contextId"),
+                    session_id=filters.get("sessionId"),
+                    state=filters.get("state"),
+                    active_only=bool(filters.get("activeOnly")),
+                    updated_after=filters.get("updatedAfter"),
+                    limit=filters.get("limit"),
+                )
+                await emit({"type": "done", "result": {"tasks": [compact_task(task, include_artifacts=False, history_limit=3) for task in tasks]}})
                 return
 
             if action == "job_status":
@@ -1533,6 +1757,23 @@ async def run_server(backend: str, socket_path: Path, workspace_root: Path) -> N
                     await emit({"type": "error", "message": f"Unknown job: {job_id}"})
                     return
                 await emit({"type": "done", "result": job.snapshot()})
+                return
+
+            if action == "get_task":
+                task_id = str(request.get("taskId") or request.get("jobId") or "")
+                job = jobs.get(task_id)
+                if job:
+                    task = task_summary_from_job(job)
+                else:
+                    task = load_task(bridge.backend, task_id)
+                if not task:
+                    await emit({"type": "error", "message": f"Unknown task: {task_id}"})
+                    return
+                include_artifacts = bool(request.get("includeArtifacts", True))
+                history_limit = request.get("historyLimit")
+                if history_limit is not None:
+                    history_limit = int(history_limit)
+                await emit({"type": "done", "result": compact_task(task, include_artifacts=include_artifacts, history_limit=history_limit)})
                 return
 
             if action == "job_events":
@@ -1559,6 +1800,63 @@ async def run_server(backend: str, socket_path: Path, workspace_root: Path) -> N
                 next_offset = offset + len(returned_events)
                 is_done = job.done_event.is_set() and next_offset == len(job.events)
                 await emit({"type": "done", "result": {"events": returned_events, "nextOffset": next_offset, "done": is_done, "status": job.status}})
+                return
+
+            if action == "task_events":
+                task_id = str(request.get("taskId") or request.get("jobId") or "")
+                offset = int(request.get("offset") or 0)
+                limit_events = int(request.get("limitEvents") or 500)
+                task = load_task(bridge.backend, task_id)
+                if not task:
+                    await emit({"type": "error", "message": f"Unknown task: {task_id}"})
+                    return
+                events = load_task_events(bridge.backend, task_id, offset=offset, limit=limit_events)
+                next_offset = offset + len(events)
+                total_seen = next_offset
+                try:
+                    with task_events_path(bridge.backend, task_id).open("r", encoding="utf-8") as f:
+                        total_seen = sum(1 for _ in f)
+                except FileNotFoundError:
+                    total_seen = next_offset
+                state = str((task.get("status") or {}).get("state") or "unknown")
+                await emit({"type": "done", "result": {"events": events, "nextOffset": next_offset, "done": is_terminal_state(state) and next_offset >= total_seen, "status": state}})
+                return
+
+            if action == "cancel_task":
+                task_id = str(request.get("taskId") or request.get("jobId") or "")
+                job = jobs.get(task_id)
+                task = load_task(bridge.backend, task_id)
+                if job:
+                    task = task_summary_from_job(job)
+                if not task:
+                    await emit({"type": "error", "message": f"Unknown task: {task_id}"})
+                    return
+                state = str((task.get("status") or {}).get("state") or "unknown")
+                if is_terminal_state(state):
+                    await emit({"type": "done", "result": compact_task(task, history_limit=10)})
+                    return
+                if job and job.status == "queued" and job.task and not job.task.done():
+                    job.task.cancel()
+                    job.status = "cancelled"
+                    job.completed_at = time.time()
+                    job.done_event.set()
+                    save_job(runtime_paths, job)
+                    task = sync_task_from_job(job, event_type="task.canceled", payload={"reason": "Canceled before backend execution"})
+                    await emit({"type": "done", "result": compact_task(task, history_limit=10)})
+                    return
+                with task_lock(bridge.backend):
+                    task = load_task(bridge.backend, task_id) or task
+                    append_task_event(
+                        task,
+                        "task.cancel_failed",
+                        {
+                            "reason": "not_cancelable",
+                            "message": "Backend does not expose safe per-task cancellation; shared bridge process was left running.",
+                        },
+                    )
+                    task.setdefault("metadata", {})["lastCancelError"] = "not_cancelable"
+                    save_task(task)
+                await emit({"type": "done", "result": {"notCancelable": True, "task": compact_task(task, history_limit=10)}})
                 return
 
             if action == "resolve_permission":
@@ -1623,6 +1921,31 @@ async def run_server(backend: str, socket_path: Path, workspace_root: Path) -> N
                 else:
                     future.set_result({"outcome": {"outcome": "cancelled"}})
 
+                task_id = perm_request.get("jobId")
+                if task_id:
+                    try:
+                        with task_lock(backend):
+                            task = load_task(backend, str(task_id))
+                            if task:
+                                metadata = task.setdefault("metadata", {})
+                                pending = metadata.setdefault("pendingPermissions", {})
+                                if isinstance(pending, dict):
+                                    pending.pop(str(request_id), None)
+                                resolved = metadata.setdefault("resolvedPermissions", [])
+                                if isinstance(resolved, list):
+                                    resolved.append({"requestId": request_id, "decision": decision, "scope": scope, "timestamp": time.time()})
+                                update_task_status(
+                                    task,
+                                    "working",
+                                    f"Permission {decision}ed; backend is processing",
+                                    event_type="task.permission_resolved",
+                                    payload={"requestId": request_id, "decision": decision, "scope": scope},
+                                )
+                                save_task(task)
+                    except Exception as exc:
+                        sys.stderr.write(f"[task-permission-resolve-error] {exc}\n")
+                        sys.stderr.flush()
+
                 await emit({"type": "done", "result": {"resolved": True}})
                 return
 
@@ -1670,9 +1993,38 @@ async def run_server(backend: str, socket_path: Path, workspace_root: Path) -> N
                     session_id=session_id,
                 )
                 jobs[job.job_id] = job
+                with task_lock(job.backend):
+                    task = load_task(job.backend, job.job_id) or new_task(
+                        task_id=job.job_id,
+                        backend=job.backend,
+                        prompt=job.prompt,
+                        workspace_root=job.workspace_root,
+                        context_id=job.session_id or job.workspace_root,
+                        status="submitted",
+                        created_at=job.created_at,
+                        metadata={
+                            "jobId": job.job_id,
+                            "sessionMode": job.session_mode,
+                            "sessionId": job.session_id,
+                            "backendJobStatus": job.status,
+                        },
+                    )
+                    if not task.get("history"):
+                        append_history(task, "user", job.prompt, timestamp=job.created_at)
+                    append_task_event(
+                        task,
+                        "task.submitted",
+                        {
+                            "prompt": job.prompt,
+                            "workspaceRoot": job.workspace_root,
+                            "sessionMode": job.session_mode,
+                            "sessionId": job.session_id,
+                        },
+                    )
+                    save_task(task)
                 save_job(runtime_paths, job)
                 job.task = asyncio.create_task(execute_job(job))
-                await emit({"type": "done", "result": {"submitted": True, "jobId": job.job_id, "status": job.status}})
+                await emit({"type": "done", "result": {"submitted": True, "jobId": job.job_id, "taskId": job.job_id, "status": normalize_task_state(job.status)}})
                 return
 
             prompt = request.get("prompt")
@@ -1811,6 +2163,25 @@ async def get_job_events(socket_path: Path, job_id: str, offset: int = 0, limit_
     return await _send_socket_request(socket_path, {"action": "job_events", "jobId": job_id, "offset": offset, "limitEvents": limit_events, "limitBytes": limit_bytes})
 
 
+async def list_tasks_via_socket(socket_path: Path, filters: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    return await _send_socket_request(socket_path, {"action": "list_tasks", "filters": filters or {}})
+
+
+async def get_task_via_socket(socket_path: Path, task_id: str, *, include_artifacts: bool = True, history_limit: Optional[int] = 20) -> dict[str, Any]:
+    payload: dict[str, Any] = {"action": "get_task", "taskId": task_id, "includeArtifacts": include_artifacts}
+    if history_limit is not None:
+        payload["historyLimit"] = history_limit
+    return await _send_socket_request(socket_path, payload)
+
+
+async def get_task_events(socket_path: Path, task_id: str, offset: int = 0, limit_events: int = 500) -> dict[str, Any]:
+    return await _send_socket_request(socket_path, {"action": "task_events", "taskId": task_id, "offset": offset, "limitEvents": limit_events})
+
+
+async def cancel_task_via_socket(socket_path: Path, task_id: str) -> dict[str, Any]:
+    return await _send_socket_request(socket_path, {"action": "cancel_task", "taskId": task_id})
+
+
 async def list_permissions(socket_path: Path) -> dict[str, Any]:
     return await _send_socket_request(socket_path, {"action": "list_permissions"})
 
@@ -1889,39 +2260,128 @@ def _print_event(event: dict[str, Any], plain: bool) -> Optional[int]:
 def format_jobs_table(jobs: list[dict[str, Any]]) -> str:
     if not jobs:
         return "No jobs found."
-    lines = ["JOB ID           STATUS     CREATED AT      PROMPT"]
+    lines = ["TASK ID          STATE          UPDATED       MESSAGE                       WORKSPACE"]
     for job in jobs:
-        job_id = str(job.get("jobId") or "-")[:16]
-        status = str(job.get("status") or "-")[:10]
-        created = str(job.get("createdAt") or "-")[:16]
-        prompt = str(job.get("prompt") or "")[:80]
-        lines.append(f"{job_id:<16} {status:<10} {created:<16} {prompt}")
+        job_id = str(job.get("jobId") or job.get("id") or "-")[:16]
+        status = normalize_task_state(job.get("status") or (job.get("status") or {}).get("state"))
+        updated = str(job.get("updatedAt") or job.get("createdAt") or "-")[:13]
+        prompt = str(job.get("prompt") or "")[:28]
+        workspace = str(job.get("workspaceRoot") or "")[:36]
+        lines.append(f"{job_id:<16} {status:<14} {updated:<13} {prompt:<29} {workspace}")
+    return "\n".join(lines)
+
+
+def format_age(timestamp: Any) -> str:
+    try:
+        seconds = max(0, int(time.time() - float(timestamp)))
+    except Exception:
+        return "-"
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 48:
+        return f"{hours}h"
+    days, hours = divmod(hours, 24)
+    return f"{days}d"
+
+
+def format_tasks_table(tasks: list[dict[str, Any]]) -> str:
+    if not tasks:
+        return "No tasks found."
+    lines = ["TASK ID          BACKEND STATE          AGE    UPDATED       MESSAGE                       WORKSPACE"]
+    for task in tasks:
+        status = task.get("status") if isinstance(task.get("status"), dict) else {}
+        task_id = str(task.get("id") or "-")[:16]
+        backend = str(task.get("backend") or "-")[:7]
+        state = str(status.get("state") or "unknown")[:14]
+        age = format_age(task.get("createdAt"))[:5]
+        updated = str(task.get("updatedAt") or "-")[:13]
+        message = " ".join(str(status.get("message") or "").split())[:28]
+        workspace = str(task.get("workspaceRoot") or "")[:36]
+        lines.append(f"{task_id:<16} {backend:<7} {state:<14} {age:<6} {updated:<13} {message:<29} {workspace}")
+    return "\n".join(lines)
+
+
+def print_task_submit_result(task: dict[str, Any]) -> None:
+    status = task.get("status") if isinstance(task.get("status"), dict) else {}
+    task_id = str(task.get("id") or task.get("jobId") or "")
+    backend = str(task.get("backend") or "")
+    print(f"Task submitted: {task_id}")
+    print(f"Backend: {backend}")
+    print(f"State: {status.get('state') or 'submitted'}")
+    print(f"Workspace: {task.get('workspaceRoot') or ''}")
+    print(f"Check: /acp-job-status {backend} {task_id}  (or /acp-task {backend} {task_id})")
+    print(f"Follow: /acp-follow {backend} {task_id}")
+    print(f"Cancel: /acp-cancel {backend} {task_id}")
+
+
+def format_task_detail(task: dict[str, Any]) -> str:
+    status = task.get("status") if isinstance(task.get("status"), dict) else {}
+    lines = [
+        f"Task: {task.get('id')}",
+        f"Backend: {task.get('backend')}",
+        f"State: {status.get('state', 'unknown')}",
+        f"Message: {status.get('message', '')}",
+        f"Workspace: {task.get('workspaceRoot', '')}",
+        f"Created: {task.get('createdAt')}",
+        f"Updated: {task.get('updatedAt')}",
+    ]
+    if task.get("completedAt"):
+        lines.append(f"Completed: {task.get('completedAt')}")
+    artifacts = task.get("artifacts") if isinstance(task.get("artifacts"), list) else []
+    if artifacts:
+        lines.append("Artifacts:")
+        for artifact in artifacts:
+            title = artifact.get("title") or artifact.get("id")
+            kind = artifact.get("type") or "artifact"
+            lines.append(f"- {artifact.get('id')}: {kind} - {title}")
+            if kind in {"final_response", "error_log"} and artifact.get("text"):
+                lines.append(str(artifact["text"]))
+            elif kind == "final_response" and artifact.get("data") is not None:
+                lines.append(json.dumps(artifact["data"], ensure_ascii=False, indent=2))
     return "\n".join(lines)
 
 
 async def follow_job(socket_path: Path, job_id: str, *, plain: bool = True, poll_interval: float = 1.0) -> int:
     offset = 0
+    last_state = ""
     while True:
-        result = await get_job_events(socket_path, job_id, offset)
-        events = result.get("events") or []
-        new_offset = int(result.get("nextOffset") or offset)
-        for event in events:
-            result = _print_event(event, plain)
-            if result is not None:
-                return result
+        task = await get_task_via_socket(socket_path, job_id, include_artifacts=True, history_limit=5)
+        status = task.get("status") if isinstance(task.get("status"), dict) else {}
+        state = str(status.get("state") or "unknown")
+        if state != last_state:
+            print(f"[task:{state}] {status.get('message') or ''}", file=sys.stderr)
+            last_state = state
 
-        if new_offset > offset:
-            offset = new_offset
-            continue
+        try:
+            result = await get_job_events(socket_path, job_id, offset)
+            events = result.get("events") or []
+            new_offset = int(result.get("nextOffset") or offset)
+            for event in events:
+                printed = _print_event(event, plain)
+                if printed is not None:
+                    if state in {"completed", "failed", "canceled", "rejected"}:
+                        return printed
 
-        if result.get("done"):
-            return 0 if result.get("status") == "completed" else 1
+            if new_offset > offset:
+                offset = new_offset
+                continue
+        except Exception:
+            result = {"done": is_terminal_state(state), "status": state}
+
+        if is_terminal_state(state) or result.get("done"):
+            if offset == 0:
+                print(format_task_detail(task))
+            return 0 if state == "completed" or result.get("status") == "completed" else 1
         await asyncio.sleep(poll_interval)
 
 
 async def main_async() -> int:
     parser = argparse.ArgumentParser(description="Persistent ACP bridge for Gemini, Qwen, and Codex")
-    parser.add_argument("command", choices=["serve", "prompt", "resume", "pick", "status", "reset", "close", "sessions", "new", "submit", "jobs", "follow", "job-status", "permissions", "approve", "deny", "policy", "doctor"], help="Bridge command")
+    parser.add_argument("command", choices=["serve", "prompt", "resume", "pick", "status", "reset", "close", "sessions", "new", "submit", "jobs", "tasks", "follow", "watch", "job-status", "task", "cancel", "permissions", "approve", "deny", "policy", "doctor"], help="Bridge command")
     parser.add_argument("text", nargs="*", help="Prompt text, job id, or request id")
     parser.add_argument("--backend", choices=SUPPORTED_BACKENDS, default="gemini", help="ACP backend to use")
     parser.add_argument("--socket", default=None, help="Unix socket path")
@@ -1944,6 +2404,10 @@ async def main_async() -> int:
         return 0
 
     if args.command == "close":
+        active_tasks = store_list_tasks(backend=backend, active_only=True)
+        if active_tasks:
+            print(json.dumps({"closed": False, "backend": backend, "activeTasks": len(active_tasks), "error": "active tasks exist"}))
+            return 1
         if socket_path.exists():
             try:
                 result = await send_simple_action(socket_path, "close")
@@ -1993,23 +2457,54 @@ async def main_async() -> int:
 
     if args.command == "jobs":
         await ensure_server(backend, socket_path, workspace_root)
-        result = await list_jobs(socket_path)
-        print(format_jobs_table(result.get("jobs") or []))
+        result = await list_tasks_via_socket(socket_path)
+        if args.no_plain:
+            print(json.dumps(result, ensure_ascii=False))
+        else:
+            print(format_tasks_table(result.get("tasks") or []))
         return 0
 
-    if args.command == "job-status":
-        if not args.text:
-            raise BridgeError("Job id is required")
+    if args.command == "tasks":
         await ensure_server(backend, socket_path, workspace_root)
-        result = await get_job_status(socket_path, args.text[0])
-        print(json.dumps(result, ensure_ascii=False))
+        result = await list_tasks_via_socket(socket_path)
+        if args.no_plain:
+            print(json.dumps(result, ensure_ascii=False))
+        else:
+            print(format_tasks_table(result.get("tasks") or []))
         return 0
 
-    if args.command == "follow":
+    if args.command in ("job-status", "task"):
         if not args.text:
-            raise BridgeError("Job id is required")
+            raise BridgeError("Task id is required")
+        await ensure_server(backend, socket_path, workspace_root)
+        result = await get_task_via_socket(socket_path, args.text[0])
+        if args.no_plain:
+            print(json.dumps(result, ensure_ascii=False))
+        else:
+            print(format_task_detail(result))
+        return 0
+
+    if args.command in ("follow", "watch"):
+        if not args.text:
+            raise BridgeError("Task id is required")
         await ensure_server(backend, socket_path, workspace_root)
         return await follow_job(socket_path, args.text[0], plain=not args.no_plain)
+
+    if args.command == "cancel":
+        if not args.text:
+            raise BridgeError("Task id is required")
+        await ensure_server(backend, socket_path, workspace_root)
+        result = await cancel_task_via_socket(socket_path, args.text[0])
+        if args.no_plain:
+            print(json.dumps(result, ensure_ascii=False))
+            return 1 if result.get("notCancelable") else 0
+        if result.get("notCancelable"):
+            task = result.get("task") or {}
+            print("Task is not safely cancelable by this backend.")
+            print(format_task_detail(task))
+            return 1
+        print(format_task_detail(result))
+        return 0
 
     if args.command == "permissions":
         await ensure_server(backend, socket_path, workspace_root)
@@ -2095,7 +2590,12 @@ async def main_async() -> int:
             session_mode=session_mode,
             session_id=session_id,
         )
-        print(json.dumps(result, ensure_ascii=False))
+        task_id = str(result.get("taskId") or result.get("jobId") or "")
+        task = await get_task_via_socket(socket_path, task_id) if task_id else result
+        if args.no_plain:
+            print(json.dumps(task, ensure_ascii=False))
+        else:
+            print_task_submit_result(task)
         return 0
 
     if args.command in {"prompt", "resume", "pick"}:

@@ -5,10 +5,10 @@ A personal [Claude Code](https://claude.ai/code) plugin that gives Claude Code d
 ## What this plugin does
 
 - **Bundles its own ACP client** (`plugins/acp-bridge/bin/acp-client`, a single-file Python 3 stdlib implementation) — no separate install step needed for the bridge itself
-- Wraps the bundled client in 17 Claude Code slash commands that manage persistent Gemini / Qwen / Codex sessions, background jobs, and permission requests
+- Wraps the bundled client in Claude Code slash commands that manage persistent Gemini / Qwen / Codex sessions, background tasks, legacy job commands, and permission requests
 - Both you and Claude (the model) can invoke any command — slash commands are model-invokable by default
 - **Smart session lifecycle**: idle bridges get closed on session end, but bridges with in-flight background jobs are preserved so long-running work survives a Claude Code restart
-- **Background job watcher (daemon mode)**: a long-lived poller runs for the entire session, queues completion reports to a pending file, fires Telegram pings instantly, and injects queued reports into the model's context on your next message via a `UserPromptSubmit` hook. Handles unlimited job completions per session with no restart required.
+- **Background task watcher (daemon mode)**: a long-lived poller runs for the entire session, queues terminal/input-required reports to a pending file, fires Telegram pings instantly, and injects queued reports into the model's context on your next message via a `UserPromptSubmit` hook. Handles unlimited task transitions per session with no restart required.
 - **Self-healing**: if the watcher daemon crashes, it's automatically respawned on your next turn
 - Portable across machines — install the plugin and everything including the client comes with it
 
@@ -34,7 +34,7 @@ claude plugin marketplace add fobtastic/claude-acp-bridge
 claude plugin install acp-bridge@claude-acp-bridge
 ```
 
-Restart Claude Code. The 17 `/acp-*` slash commands, the lifecycle hooks, and the bundled `acp-client` binary will all load automatically — no separate ACP tool install step.
+Restart Claude Code. The `/acp-*` slash commands, the lifecycle hooks, and the bundled `acp-client` binary will all load automatically — no separate ACP tool install step.
 
 ### From a local clone
 
@@ -62,10 +62,14 @@ All commands accept an optional `[backend]` or `<backend>` argument as `gemini`,
 | `/acp-resume` | `<backend> <text>` | Resume the latest session with a new prompt. |
 | `/acp-pick` | `<backend> <text>` | Pick a session interactively and send a prompt. |
 | `/acp-new` | `<backend> <text>` | Start a fresh session with an initial prompt. |
-| `/acp-submit` | `<backend> <text>` | Submit a prompt as a **background job**. Returns a job ID immediately; the backend keeps working after you disconnect. This is the command for autonomous delegation. |
-| `/acp-jobs` | `[backend]` | List background jobs. |
-| `/acp-job-status` | `<backend> <job-id>` | Inspect one job's status (queued / running / completed / failed). |
-| `/acp-follow` | `<backend> <job-id>` | Wait for a job to finish and return its full output. Blocking. |
+| `/acp-submit` | `<backend> <text>` | Submit a prompt as a **background task**. Returns a stable task/job ID immediately; the backend keeps working after you disconnect. This is the command for autonomous delegation. |
+| `/acp-jobs` | `[backend]` | List background tasks using the legacy command name. |
+| `/acp-job-status` | `<backend> <task-id>` | Inspect one task's status (`submitted` / `working` / `input_required` / `auth_required` / `completed` / `failed` / `canceled` / `rejected` / `unknown`). |
+| `/acp-follow` | `<backend> <task-id>` | Poll a task until terminal and return accumulated output or final artifacts. Blocking. |
+| `/acp-tasks` | `[backend]` | Alias for listing background tasks. |
+| `/acp-task` | `<backend> <task-id>` | Alias for inspecting one task. |
+| `/acp-cancel` | `<backend> <task-id>` | Best-effort cancel. Never kills a shared backend process if that could interrupt unrelated active tasks. |
+| `/acp-watch` | `<backend> <task-id>` | Alias for following a task until terminal. |
 | `/acp-close` | `<backend>` | Close a bridge (stop the backing process). |
 | `/acp-reset` | `<backend>` | Reset bridge state. |
 | `/acp-doctor` | — | Run a full health check: CLI availability, socket liveness, watcher status, cache permissions, Telegram config, policy rules. |
@@ -110,14 +114,14 @@ Stop and report if:
 When all tasks are done, run the full test suite and report PASS/FAIL with a summary."
 ```
 
-`/acp-submit` returns a job ID immediately. Qwen starts executing in the background. The `activeJobs` counter on the qwen bridge bumps to 1.
+`/acp-submit` returns a task ID immediately. Existing command names still accept this ID as a job ID for compatibility. Qwen starts executing in the background. The task state moves from `submitted` to `working`.
 
 ### 3. Walk away (or work on something else)
 
 **Quit Claude Code, close your laptop, whatever.** The plugin's `SessionEnd` hook queries each backend's `activeJobs` count before shutting down:
 
-- `activeJobs > 0` → leave the bridge alone, log `skipping qwen — 1 active jobs` to stderr
-- `activeJobs == 0` → close the idle bridge (clean, releases memory)
+- active tasks or backend jobs exist → leave the bridge alone
+- no active tasks or backend jobs → close the idle bridge (clean, releases memory)
 
 Your qwen job keeps running. Bridges from workspaces you didn't touch this session aren't affected.
 
@@ -126,9 +130,9 @@ Your qwen job keeps running. Bridges from workspaces you didn't touch this sessi
 When you reopen Claude Code:
 
 ```
-/acp-jobs qwen           # list all jobs, with status
-/acp-job-status qwen <id> # detailed status of one job
-/acp-follow qwen <id>    # block until the job finishes, return full output
+/acp-jobs qwen            # list all tasks, with status
+/acp-job-status qwen <id> # detailed status of one task
+/acp-follow qwen <id>    # block until the task finishes, return output/artifacts
 ```
 
 Or — with the [background watcher](#background-job-watcher) running — you'll get a notification inside your Claude Code session on your next message after qwen finishes.
@@ -143,16 +147,16 @@ ACP bridges are **persistent singleton processes** — one gemini bridge, one qw
 
 Without cleanup, these bridges would accumulate indefinitely. The plugin tracks which backends you touch in a session and applies smart cleanup on `SessionEnd`:
 
-- For each backend used this session, query its `activeJobs` count
-- If `activeJobs > 0`: **leave it alone** (background work in flight)
-- If `activeJobs == 0`: **close the bridge** (release memory)
+- For each backend used this session, query active task snapshots and the backend `activeJobs` count
+- If any active task/job exists: **leave it alone** (background work in flight)
+- If no active task/job exists: **close the bridge** (release memory)
 
 Per-session state files live in `~/.cache/claude-acp-bridge/sessions/`:
 
 | File | Purpose |
 |---|---|
 | `<session>.list` | Backends touched this session (one per line) |
-| `<session>.lastjobs` | Watcher's job snapshot for transition diffing |
+| `<session>.lastjobs` | Watcher's task snapshot for transition diffing |
 | `<session>.watcher.pid` | PID of the running watcher daemon |
 | `<session>.pending` | Queued completion reports awaiting the next user turn |
 | `<session>.pending.inflight` | Transient — drained-but-not-yet-injected reports |
@@ -167,14 +171,26 @@ All are removed on `SessionEnd`.
 - **Cross-session interference**: because bridges are global singletons, any Claude Code session's `SessionEnd` can close a backend used by another concurrent session. The `activeJobs > 0` guard protects background jobs but not in-flight synchronous prompts from other sessions. Recovery is automatic — next use respawns the bridge.
 - **External bridges aren't tracked**: bridges started outside Claude Code (e.g., by the pi-coding-agent extension) aren't cleaned up by this plugin. Intentional.
 - **State file leaks on crash**: if Claude Code terminates abnormally, the state file is orphaned. Harmless — next `SessionStart` creates a fresh one.
-- **Permission files preserved with active jobs**: when a session ends but a backend is preserved (active jobs > 0), the `<session>.permission.pending` files are also preserved so in-flight permission requests aren't lost. They're cleaned up on the next session end when all jobs have completed.
+- **Permission files preserved with active tasks**: when a session ends but a backend is preserved (active work exists), the `<session>.permission.pending` files are also preserved so in-flight permission requests aren't lost. They're cleaned up on the next session end when all tasks have completed.
+
+## Task lifecycle model
+
+Background jobs are now represented internally as durable tasks under `~/.cache/claude-acp-bridge/tasks/<backend>/`.
+
+- `<task-id>.json` is the latest human-readable snapshot with `schemaVersion: 1`
+- `<task-id>.events.jsonl` is the append-only audit log
+- Existing job IDs are reused as task IDs where possible
+- Artifacts hold durable outputs such as final responses, error logs, backend job records, and task event logs
+- Progress and permission activity are recorded as status/history/events rather than turning every line into an artifact
+
+Task states are `submitted`, `working`, `input_required`, `auth_required`, `completed`, `failed`, `canceled`, `rejected`, and `unknown`. Terminal states are `completed`, `failed`, `canceled`, and `rejected`; interrupted states are `input_required` and `auth_required`; active states are `submitted`, `working`, `input_required`, and `auth_required`.
 
 ## Background job watcher
 
 The plugin spawns a long-lived background poller at `SessionStart` (via an asyncRewake hook used purely as a "spawn-and-forget" vehicle — no wake-on-exit semantics). It runs for the entire session:
 
-1. Polls `acp-client --backend <b> jobs` for all three backends every 30 seconds (configurable via `ACP_BRIDGE_WATCH_INTERVAL`)
-2. Compares snapshots to detect terminal transitions (any job → completed / succeeded / failed / error / cancelled / done)
+1. Polls task snapshots for all three backends every 30 seconds (configurable via `ACP_BRIDGE_WATCH_INTERVAL`)
+2. Compares snapshots to detect terminal transitions and `input_required` / `auth_required` transitions
 3. When a transition is detected:
    - **Appends** a formatted report to `~/.cache/claude-acp-bridge/sessions/<session_id>.pending`
    - **Immediately** fires a Telegram push to your phone (if configured) — this is instant, not deferred
@@ -196,7 +212,7 @@ Notifications never arrive "mid-turn" while Claude is already responding — tha
 ### Limitations
 
 - **Injection latency = your next-message gap**: if a job finishes and you don't type anything to Claude for an hour, the in-session reminder is delayed by that hour. Telegram bridges the gap for AFK notifications.
-- **No progress updates**: only terminal transitions notify. A job that's been running for an hour is silent until it finishes. If you need intermediate status, invoke `/acp-job-status <backend> <id>` manually.
+- **No noisy progress updates**: terminal and input/auth-required transitions notify. A task that's been running for an hour is silent until it finishes or needs input. If you need intermediate status, invoke `/acp-job-status <backend> <id>` manually.
 
 ## Configuration
 
@@ -259,8 +275,9 @@ The Claude Code Telegram plugin runs one MCP server instance per Claude Code pro
 ## Development
 
 - **Key files**:
-  - `plugins/acp-bridge/bin/acp-client` — **the bundled ACP client** (single-file Python 3 stdlib implementation; ~2200 lines). Handles the ACP protocol, per-backend Unix-socket RPC, session state, background job lifecycle, and permission monitoring with progressive trust. Shells out to external `gemini` / `qwen` / `codex` CLIs for the actual model calls.
-  - `plugins/acp-bridge/commands/*.md` — the 17 slash command definitions
+  - `plugins/acp-bridge/bin/acp-client` — **the bundled ACP client**. Handles the ACP protocol, per-backend Unix-socket RPC, session state, task-wrapped background job lifecycle, and permission monitoring with progressive trust. Shells out to external `gemini` / `qwen` / `codex` CLIs for the actual model calls.
+  - `plugins/acp-bridge/bin/acp_task_store.py` — durable task snapshots, append-only events, state predicates, artifact helpers, and list filters
+  - `plugins/acp-bridge/commands/*.md` — the slash command definitions
   - `plugins/acp-bridge/scripts/acp.sh` — shared argument parser and dispatcher that invokes the bundled client
   - `plugins/acp-bridge/scripts/_lib.sh` — shared helpers (session paths, backend validation, JSON parsing)
   - `plugins/acp-bridge/scripts/session-hook.sh` — SessionStart / SessionEnd handler (tracking + smart cleanup)

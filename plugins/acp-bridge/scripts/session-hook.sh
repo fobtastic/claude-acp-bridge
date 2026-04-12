@@ -63,6 +63,19 @@ case "$ACTION" in
     while IFS= read -r backend; do
       [ -z "$backend" ] && continue
 
+      active_tasks=$(ACP_CLIENT_BIN="$ACP_CLIENT_BIN" BACKEND="$backend" python3 -c '
+import os, sys
+from pathlib import Path
+client = os.environ.get("ACP_CLIENT_BIN", "")
+if client:
+    sys.path.insert(0, str(Path(client).resolve().parent))
+try:
+    from acp_task_store import list_tasks
+    print(len(list_tasks(backend=os.environ["BACKEND"], active_only=True)))
+except Exception:
+    print(0)
+' 2>/dev/null || echo "0")
+
       status_json=$("$ACP_CLIENT_BIN" --workspace "$ACP_WORKSPACE" --backend "$backend" status 2>/dev/null || echo "{}")
       active_jobs=$(python3 -c '
 import json, sys
@@ -73,9 +86,9 @@ except Exception:
     print(0)
 ' <<<"$status_json" 2>/dev/null || echo "0")
 
-      if [ "$active_jobs" -gt 0 ]; then
+      if [ "$active_tasks" -gt 0 ] || [ "$active_jobs" -gt 0 ]; then
         any_preserved=1
-        echo "acp-bridge: skipping ${backend} — ${active_jobs} active jobs" >&2
+        echo "acp-bridge: skipping ${backend} — ${active_tasks} active tasks (${active_jobs} backend jobs)" >&2
       else
         "$ACP_CLIENT_BIN" --workspace "$ACP_WORKSPACE" --backend "$backend" close >/dev/null 2>&1 || true
         echo "acp-bridge: closed idle ${backend}" >&2
