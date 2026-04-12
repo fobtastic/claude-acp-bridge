@@ -113,7 +113,7 @@ run_backend_and_text_command() {
 }
 
 case "$SUBCOMMAND" in
-  status|sessions|jobs)
+  status|sessions|jobs|permissions|policy)
     run_info_command "$SUBCOMMAND"
     ;;
   close|reset)
@@ -124,6 +124,9 @@ case "$SUBCOMMAND" in
     ;;
   job-status|follow)
     run_backend_and_text_command "$SUBCOMMAND" "<job-id>"
+    ;;
+  approve|deny)
+    run_backend_and_text_command "$SUBCOMMAND" "<request-id> [--session|--always]"
     ;;
   *)
     echo "acp-bridge: unknown subcommand '$SUBCOMMAND'" >&2

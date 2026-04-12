@@ -46,6 +46,7 @@ case "$ACTION" in
       rm -f "$SESSION_PID_FILE"
     fi
     rm -f "$SESSION_LASTJOBS_FILE" "$SESSION_PENDING_FILE" "$SESSION_INFLIGHT_FILE"
+    rm -f "$SESSION_PERM_PENDING" "$SESSION_PERM_INFLIGHT"
 
     if [ ! -f "$SESSION_LIST_FILE" ]; then
       exit 0

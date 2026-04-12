@@ -60,6 +60,8 @@ except Exception:
 #   SESSION_PID_FILE      — watcher daemon PID (noclobber-locked)
 #   SESSION_PENDING_FILE  — queued transition reports for injection
 #   SESSION_INFLIGHT_FILE — transient drained file being injected
+#   SESSION_PERM_PENDING  — queued permission requests
+#   SESSION_PERM_INFLIGHT — transient drained permission file
 session_paths() {
   local sid="$1"
   SESSION_LIST_FILE="$STATE_DIR/${sid}.list"
@@ -67,6 +69,8 @@ session_paths() {
   SESSION_PID_FILE="$STATE_DIR/${sid}.watcher.pid"
   SESSION_PENDING_FILE="$STATE_DIR/${sid}.pending"
   SESSION_INFLIGHT_FILE="$STATE_DIR/${sid}.pending.inflight"
+  SESSION_PERM_PENDING="$STATE_DIR/${sid}.permission.pending"
+  SESSION_PERM_INFLIGHT="$STATE_DIR/${sid}.permission.pending.inflight"
 }
 
 # Human-readable list of backends for error messages: "gemini, qwen, or codex".

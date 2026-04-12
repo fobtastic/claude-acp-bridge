@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import fnmatch
 import json
 import os
 import shutil
@@ -61,17 +62,24 @@ class BackendSpec:
     supports_local_discovery: bool = False
 
 
+def _build_backend_command(name: str, base_command: tuple[str, ...], yolo_flag: str = "--yolo") -> tuple[str, ...]:
+    env_key = f"ACP_{name.upper()}_YOLO"
+    if os.environ.get(env_key, "true").lower() in ("0", "false", "no", "off"):
+        return tuple(arg for arg in base_command if arg != yolo_flag)
+    return base_command
+
+
 BACKENDS: dict[str, BackendSpec] = {
     "gemini": BackendSpec(
         name="gemini",
         title="Gemini",
-        command=("gemini", "--acp", "--yolo"),
+        command=_build_backend_command("gemini", ("gemini", "--acp", "--yolo")),
         supports_local_discovery=True,
     ),
     "qwen": BackendSpec(
         name="qwen",
         title="Qwen",
-        command=("qwen", "--acp", "--yolo"),
+        command=_build_backend_command("qwen", ("qwen", "--acp", "--yolo")),
         supports_local_discovery=True,
     ),
     "codex": BackendSpec(
@@ -279,6 +287,9 @@ class ACPBridge:
         self._session_ready = asyncio.Event()
         self._initialized = False
         self._jobs: dict[str, PromptJob] = {}
+        self._pending_permissions: dict[str, tuple[asyncio.Future, dict[str, Any]]] = {}
+        self._session_permission_rules: list[dict[str, Any]] = []
+        self._current_job_id: Optional[str] = None
 
     async def start(self) -> None:
         if self.process and self.process.returncode is None and self._initialized:
@@ -706,17 +717,92 @@ class ACPBridge:
         return {}
 
     async def _handle_permission_request(self, params: dict[str, Any]) -> dict[str, Any]:
-        options = params.get("options") or []
-        selected = None
-        for option in options:
-            if option.get("kind") in {"allow_always", "allow_once"}:
-                selected = option
-                break
-        if selected is None and options:
-            selected = options[0]
-        if not selected:
+        action_info = self._extract_action_info(params)
+        backend = self.backend
+
+        # 1. Check session rules
+        for rule in reversed(self._session_permission_rules):
+            if rule_matches(rule, backend, action_info):
+                return self._resolve_from_rule(rule, params)
+
+        # 2. Check persistent policy
+        policy = load_policy_file()
+        for rule in policy.get("rules", []):
+            if rule_matches(rule, backend, action_info):
+                return self._resolve_from_rule(rule, params)
+
+        # 3. No match -> queue + block
+        request_id = f"perm_{uuid.uuid4().hex[:12]}"
+        future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+
+        perm_request = {
+            "requestId": request_id,
+            "backend": backend,
+            "jobId": self._current_job_id,
+            "timestamp": time.time(),
+            "description": params.get("description") or f"Permission request from {backend}",
+            "action": action_info,
+            "options": params.get("options") or [],
+            "workspaceRoot": str(self.workspace_root),
+        }
+
+        self._pending_permissions[request_id] = (future, perm_request)
+
+        if self.session_id:
+            pending_file = get_session_state_dir() / f"{self.session_id}.permission.pending"
+            pending_file.parent.mkdir(parents=True, exist_ok=True)
+            with pending_file.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(perm_request) + "\n")
+
+        try:
+            # 30-minute timeout for user to approve/deny
+            return await asyncio.wait_for(future, timeout=1800)
+        except asyncio.TimeoutError:
+            self._pending_permissions.pop(request_id, None)
             return {"outcome": {"outcome": "cancelled"}}
-        return {"outcome": {"outcome": "selected", "optionId": selected.get("optionId")}}
+
+    def _extract_action_info(self, params: dict[str, Any]) -> dict[str, Any]:
+        # Flexible parser for action info. CLIs vary in what they provide.
+        action = {
+            "type": params.get("type") or "unknown",
+            "path": params.get("path"),
+            "command": params.get("command"),
+            "raw": params,
+        }
+
+        # Heuristic fallback if type is missing but description exists
+        desc = params.get("description", "").lower()
+        if action["type"] == "unknown" and desc:
+            if any(k in desc for k in ("write", "create", "delete", "modify")):
+                action["type"] = "file_write"
+            elif "read" in desc:
+                action["type"] = "file_read"
+            elif any(k in desc for k in ("run", "execute", "command")):
+                action["type"] = "shell_command"
+            elif "network" in desc or "http" in desc:
+                action["type"] = "network"
+
+        # If we have path/command in params but not at top level, log it
+        for k, v in params.items():
+            if k not in ("type", "path", "command", "description", "options") and isinstance(v, (str, int, float)):
+                sys.stderr.write(f"[permission-debug] Extra param: {k}={v}\n")
+
+        return action
+
+    def _resolve_from_rule(self, rule: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]:
+        decision = rule.get("decision")
+        options = params.get("options") or []
+
+        if decision == "allow":
+            for opt in options:
+                if opt.get("kind") in {"allow_always", "allow_once"}:
+                    return {"outcome": {"outcome": "selected", "optionId": opt.get("optionId")}}
+        elif decision == "deny":
+            for opt in options:
+                if opt.get("kind") in {"deny", "cancel"}:
+                    return {"outcome": {"outcome": "selected", "optionId": opt.get("optionId")}}
+
+        return {"outcome": {"outcome": "cancelled"}}
 
     async def _handle_terminal_create(self, params: dict[str, Any]) -> dict[str, Any]:
         command = params.get("command")
@@ -884,6 +970,10 @@ def get_runtime_paths(backend: str) -> RuntimePaths:
     )
 
 
+def get_session_state_dir() -> Path:
+    return Path.home() / ".cache" / "claude-acp-bridge" / "sessions"
+
+
 def get_jobs_dir(runtime_paths: RuntimePaths) -> Path:
     return runtime_paths.root / "jobs"
 
@@ -947,6 +1037,59 @@ def ensure_private_file(path: Path) -> None:
         pass
     except PermissionError:
         pass
+
+
+def get_policy_file_path() -> Path:
+    return Path.home() / ".config" / "claude-acp-bridge" / "permission-policy.json"
+
+
+def load_policy_file() -> dict[str, Any]:
+    path = get_policy_file_path()
+    if not path.exists():
+        return {"version": 1, "rules": []}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {"version": 1, "rules": []}
+        return data
+    except Exception:
+        return {"version": 1, "rules": []}
+
+
+def save_policy_rule(rule: dict[str, Any]) -> None:
+    path = get_policy_file_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    policy = load_policy_file()
+    policy["rules"].append(rule)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(policy, indent=2, sort_keys=True), encoding="utf-8")
+    ensure_private_file(tmp)
+    tmp.replace(path)
+    ensure_private_file(path)
+
+
+def clear_policy() -> None:
+    path = get_policy_file_path()
+    if path.exists():
+        path.unlink()
+
+
+def rule_matches(rule: dict[str, Any], backend: str, action_info: dict[str, Any]) -> bool:
+    rule_backend = rule.get("backend")
+    if rule_backend != "*" and rule_backend != backend:
+        return False
+
+    rule_action_type = rule.get("actionType")
+    if rule_action_type != "*" and rule_action_type != action_info.get("type"):
+        return False
+
+    rule_pattern = rule.get("pathPattern")
+    if rule_pattern and rule_pattern != "*":
+        path = action_info.get("path") or ""
+        if not fnmatch.fnmatch(path, rule_pattern):
+            return False
+
+    return True
 
 
 def qwen_project_slug(workspace_root: Path) -> str:
@@ -1276,6 +1419,7 @@ async def run_server(backend: str, socket_path: Path, workspace_root: Path) -> N
             await append_job_event(job, event)
 
         try:
+            bridge._current_job_id = job.job_id
             await bridge.prompt(
                 job.prompt,
                 event_cb=record,
@@ -1291,6 +1435,9 @@ async def run_server(backend: str, socket_path: Path, workspace_root: Path) -> N
                 save_job(runtime_paths, job)
         except Exception as exc:
             await append_job_event(job, {"type": "error", "message": str(exc)})
+        finally:
+            if bridge._current_job_id == job.job_id:
+                bridge._current_job_id = None
 
     async def handle_connection(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         async def emit(event: JsonValue) -> None:
@@ -1379,6 +1526,76 @@ async def run_server(backend: str, socket_path: Path, workspace_root: Path) -> N
                 next_offset = offset + len(returned_events)
                 is_done = job.done_event.is_set() and next_offset == len(job.events)
                 await emit({"type": "done", "result": {"events": returned_events, "nextOffset": next_offset, "done": is_done, "status": job.status}})
+                return
+
+            if action == "resolve_permission":
+                request_id = request.get("requestId")
+                decision = request.get("decision")  # allow | deny
+                scope = request.get("scope")  # once | session | always
+
+                entry = bridge._pending_permissions.pop(request_id, None)
+                if not entry:
+                    await emit({"type": "error", "message": f"Unknown or expired permission request: {request_id}"})
+                    return
+
+                future, perm_request = entry
+
+                if scope in ("session", "always"):
+                    rule = {
+                        "id": f"rule_{uuid.uuid4().hex[:8]}",
+                        "backend": perm_request["backend"],
+                        "actionType": perm_request["action"]["type"],
+                        "pathPattern": perm_request["action"]["path"] or "*",
+                        "decision": decision,
+                        "scope": scope,
+                        "createdAt": time.time(),
+                        "createdFrom": request_id,
+                    }
+                    if scope == "session":
+                        bridge._session_permission_rules.append(rule)
+                    else:
+                        save_policy_rule(rule)
+
+                options = perm_request["options"]
+                selected_opt = None
+                if decision == "allow":
+                    for opt in options:
+                        if opt.get("kind") in {"allow_always", "allow_once"}:
+                            selected_opt = opt
+                            break
+                elif decision == "deny":
+                    for opt in options:
+                        if opt.get("kind") in {"deny", "cancel"}:
+                            selected_opt = opt
+                            break
+
+                if selected_opt:
+                    future.set_result({"outcome": {"outcome": "selected", "optionId": selected_opt.get("optionId")}})
+                else:
+                    future.set_result({"outcome": {"outcome": "cancelled"}})
+
+                await emit({"type": "done", "result": {"resolved": True}})
+                return
+
+            if action == "list_permissions":
+                perms = [p for _, p in bridge._pending_permissions.values()]
+                await emit({"type": "done", "result": {"permissions": perms}})
+                return
+
+            if action == "list_policy":
+                policy = load_policy_file()
+                rules = policy.get("rules", []) + bridge._session_permission_rules
+                await emit({"type": "done", "result": {"rules": rules}})
+                return
+
+            if action == "clear_policy":
+                scope = request.get("scope", "session")
+                if scope == "session":
+                    bridge._session_permission_rules.clear()
+                elif scope == "all":
+                    bridge._session_permission_rules.clear()
+                    clear_policy()
+                await emit({"type": "done", "result": {"cleared": True}})
                 return
 
             if action == "submit_prompt":
@@ -1545,6 +1762,22 @@ async def get_job_events(socket_path: Path, job_id: str, offset: int = 0, limit_
     return await _send_socket_request(socket_path, {"action": "job_events", "jobId": job_id, "offset": offset, "limitEvents": limit_events, "limitBytes": limit_bytes})
 
 
+async def list_permissions(socket_path: Path) -> dict[str, Any]:
+    return await _send_socket_request(socket_path, {"action": "list_permissions"})
+
+
+async def resolve_permission(socket_path: Path, request_id: str, decision: str, scope: str) -> dict[str, Any]:
+    return await _send_socket_request(socket_path, {"action": "resolve_permission", "requestId": request_id, "decision": decision, "scope": scope})
+
+
+async def list_policy_via_socket(socket_path: Path) -> dict[str, Any]:
+    return await _send_socket_request(socket_path, {"action": "list_policy"})
+
+
+async def clear_policy_via_socket(socket_path: Path, scope: str) -> dict[str, Any]:
+    return await _send_socket_request(socket_path, {"action": "clear_policy", "scope": scope})
+
+
 async def resolve_prompt_session(
     backend: str,
     socket_path: Path,
@@ -1627,8 +1860,8 @@ async def follow_job(socket_path: Path, job_id: str, *, plain: bool = True, poll
 
 async def main_async() -> int:
     parser = argparse.ArgumentParser(description="Persistent ACP bridge for Gemini, Qwen, and Codex")
-    parser.add_argument("command", choices=["serve", "prompt", "resume", "pick", "status", "reset", "close", "sessions", "new", "submit", "jobs", "follow", "job-status"], help="Bridge command")
-    parser.add_argument("text", nargs="*", help="Prompt text or job id")
+    parser.add_argument("command", choices=["serve", "prompt", "resume", "pick", "status", "reset", "close", "sessions", "new", "submit", "jobs", "follow", "job-status", "permissions", "approve", "deny", "policy"], help="Bridge command")
+    parser.add_argument("text", nargs="*", help="Prompt text, job id, or request id")
     parser.add_argument("--backend", choices=SUPPORTED_BACKENDS, default="gemini", help="ACP backend to use")
     parser.add_argument("--socket", default=None, help="Unix socket path")
     parser.add_argument("--workspace", default=str(DEFAULT_WORKSPACE), help="Workspace root")
@@ -1716,6 +1949,63 @@ async def main_async() -> int:
             raise BridgeError("Job id is required")
         await ensure_server(backend, socket_path, workspace_root)
         return await follow_job(socket_path, args.text[0], plain=not args.no_plain)
+
+    if args.command == "permissions":
+        await ensure_server(backend, socket_path, workspace_root)
+        result = await list_permissions(socket_path)
+        perms = result.get("permissions") or []
+        if not perms:
+            print("No pending permissions.")
+        else:
+            for p in perms:
+                print(f"[{p['requestId']}] {p['description']}")
+                print(f"  Backend: {p['backend']}")
+                if p.get("jobId"):
+                    print(f"  Job: {p['jobId']}")
+                print("")
+        return 0
+
+    if args.command in ("approve", "deny"):
+        if not args.text:
+            raise BridgeError(f"Request id is required for {args.command}")
+        request_id = args.text[0]
+        scope = "once"
+        if "--session" in args.text:
+            scope = "session"
+        elif "--always" in args.text:
+            scope = "always"
+
+        await ensure_server(backend, socket_path, workspace_root)
+        result = await resolve_permission(socket_path, request_id, "allow" if args.command == "approve" else "deny", scope)
+        print(json.dumps(result))
+        return 0
+
+    if args.command == "policy":
+        sub = args.text[0] if args.text else "list"
+        await ensure_server(backend, socket_path, workspace_root)
+        if sub == "list":
+            result = await list_policy_via_socket(socket_path)
+            rules = result.get("rules") or []
+            if not rules:
+                print("No policy rules.")
+            else:
+                print("ID        DECISION BACKEND  ACTION       PATTERN (SCOPE)")
+                for r in rules:
+                    print(f"{r['id']:<9} {r['decision'].upper():<8} {r['backend']:<8} {r['actionType']:<12} {r['pathPattern']} ({r['scope']})")
+        elif sub == "clear":
+            scope = "session"
+            if "--all" in args.text:
+                scope = "all"
+            result = await clear_policy_via_socket(socket_path, scope)
+            print(json.dumps(result))
+        elif sub == "reset":
+            if socket_path.exists():
+                result = await clear_policy_via_socket(socket_path, "all")
+                print(json.dumps(result))
+            else:
+                clear_policy()
+                print(json.dumps({"cleared": True}))
+        return 0
 
     if args.command == "new":
         await ensure_server(backend, socket_path, workspace_root)

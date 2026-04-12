@@ -48,21 +48,66 @@ if [ "$watcher_alive" = "0" ] && [ -x "$PLUGIN_ROOT/scripts/job-watcher.sh" ]; t
   disown 2>/dev/null || true
 fi
 
-# Drain the pending file atomically. `mv` is atomic on the same
-# filesystem: the watcher's next append (to the now-missing .pending)
-# creates a fresh file, picked up on the next turn. If .pending doesn't
-# exist yet, mv fails cleanly — nothing to inject, exit.
-mv "$SESSION_PENDING_FILE" "$SESSION_INFLIGHT_FILE" 2>/dev/null || exit 0
+# Drain pending job reports and permission requests atomically.
+# mv is atomic on the same filesystem.
+mv "$SESSION_PENDING_FILE" "$SESSION_INFLIGHT_FILE" 2>/dev/null || true
+mv "$SESSION_PERM_PENDING" "$SESSION_PERM_INFLIGHT" 2>/dev/null || true
 
-if [ ! -s "$SESSION_INFLIGHT_FILE" ]; then
-  rm -f "$SESSION_INFLIGHT_FILE"
+# If both are missing or empty, exit.
+if [ ! -s "$SESSION_INFLIGHT_FILE" ] && [ ! -s "$SESSION_PERM_INFLIGHT" ]; then
+  rm -f "$SESSION_INFLIGHT_FILE" "$SESSION_PERM_INFLIGHT"
   exit 0
 fi
 
-# Emit the hook response. Python JSON-encodes safely (newlines, quotes,
-# unicode). Claude Code injects `additionalContext` as a system reminder.
-PENDING_CONTENT=$(cat "$SESSION_INFLIGHT_FILE")
-rm -f "$SESSION_INFLIGHT_FILE"
+# Format job reports.
+PENDING_CONTENT=""
+if [ -s "$SESSION_INFLIGHT_FILE" ]; then
+  PENDING_CONTENT=$(cat "$SESSION_INFLIGHT_FILE")
+  rm -f "$SESSION_INFLIGHT_FILE"
+fi
+
+# Format permission requests human-readably.
+PERM_CONTENT=""
+if [ -s "$SESSION_PERM_INFLIGHT" ]; then
+  PERM_CONTENT=$(python3 -c '
+import json, sys
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    try:
+        p = json.loads(line)
+        print(f"--- PERMISSION REQUEST: {p[\"backend\"]} ---")
+        print(f"ID: {p[\"requestId\"]}")
+        print(f"Description: {p[\"description\"]}")
+        action = p.get("action", {})
+        if action.get("type") and action.get("type") != "unknown":
+            print(f"Action Type: {action[\"type\"]}")
+        if action.get("path"):
+            print(f"Path: {action[\"path\"]}")
+        if action.get("command"):
+            print(f"Command: {action[\"command\"]}")
+        print(f"Approve: /acp-approve {p[\"backend\"]} {p[\"requestId\"]}")
+        print(f"Deny:    /acp-deny {p[\"backend\"]} {p[\"requestId\"]}")
+        print("")
+    except Exception:
+        continue
+' < "$SESSION_PERM_INFLIGHT")
+  rm -f "$SESSION_PERM_INFLIGHT"
+fi
+
+# Combine and emit the hook response.
+# Claude Code injects `additionalContext` as a system reminder.
+FULL_CONTENT=""
+if [ -n "$PENDING_CONTENT" ]; then
+  FULL_CONTENT="$PENDING_CONTENT"
+fi
+if [ -n "$PERM_CONTENT" ]; then
+  if [ -n "$FULL_CONTENT" ]; then
+    FULL_CONTENT="${FULL_CONTENT}"$'\n\n'"${PERM_CONTENT}"
+  else
+    FULL_CONTENT="$PERM_CONTENT"
+  fi
+fi
 
 python3 -c '
 import json, sys
@@ -73,4 +118,4 @@ print(json.dumps({
         "additionalContext": content,
     }
 }))
-' <<<"$PENDING_CONTENT"
+' <<<"$FULL_CONTENT"
