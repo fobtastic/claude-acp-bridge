@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(bash *)",
+      "Bash(python3 *)",
+      "Bash(plugins/acp-bridge/bin/acp-client *)",
+      "Bash(which *)",
+      "Bash(qwen *)",
+      "Bash(qwen2.5-coder *)",
+      "Bash(git add *)",
+      "Bash(git commit *)"
+    ]
+  },
+  "$version": 3
+}

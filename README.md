@@ -5,7 +5,7 @@ A personal [Claude Code](https://claude.ai/code) plugin that gives Claude Code d
 ## What this plugin does
 
 - **Bundles its own ACP client** (`plugins/acp-bridge/bin/acp-client`, a single-file Python 3 stdlib implementation) — no separate install step needed for the bridge itself
-- Wraps the bundled client in 12 Claude Code slash commands that manage persistent Gemini / Qwen / Codex sessions
+- Wraps the bundled client in 17 Claude Code slash commands that manage persistent Gemini / Qwen / Codex sessions, background jobs, and permission requests
 - Both you and Claude (the model) can invoke any command — slash commands are model-invokable by default
 - **Smart session lifecycle**: idle bridges get closed on session end, but bridges with in-flight background jobs are preserved so long-running work survives a Claude Code restart
 - **Background job watcher (daemon mode)**: a long-lived poller runs for the entire session, queues completion reports to a pending file, fires Telegram pings instantly, and injects queued reports into the model's context on your next message via a `UserPromptSubmit` hook. Handles unlimited job completions per session with no restart required.
@@ -34,7 +34,7 @@ claude plugin marketplace add fobtastic/claude-acp-bridge
 claude plugin install acp-bridge@claude-acp-bridge
 ```
 
-Restart Claude Code. The 12 `/acp-*` slash commands, the lifecycle hooks, and the bundled `acp-client` binary will all load automatically — no separate ACP tool install step.
+Restart Claude Code. The 17 `/acp-*` slash commands, the lifecycle hooks, and the bundled `acp-client` binary will all load automatically — no separate ACP tool install step.
 
 ### From a local clone
 
@@ -68,6 +68,13 @@ All commands accept an optional `[backend]` or `<backend>` argument as `gemini`,
 | `/acp-follow` | `<backend> <job-id>` | Wait for a job to finish and return its full output. Blocking. |
 | `/acp-close` | `<backend>` | Close a bridge (stop the backing process). |
 | `/acp-reset` | `<backend>` | Reset bridge state. |
+| `/acp-doctor` | — | Run a full health check: CLI availability, socket liveness, watcher status, cache permissions, Telegram config, policy rules. |
+| `/acp-approve` | `<backend> <request-id> [--session\|--always]` | Approve a pending permission request. `--session` auto-approves matching requests for this session; `--always` creates a permanent policy rule. |
+| `/acp-deny` | `<backend> <request-id> [--always]` | Deny a pending permission request. `--always` creates a permanent deny rule. |
+| `/acp-permissions` | `[backend]` | List pending permission requests. No arg → all backends. |
+| `/acp-policy` | `[list\|clear [--session\|--all] \|reset]` | View and manage permission policy rules. |
+
+> **Tip:** most commands also accept a leading `--json` flag (e.g. `--json gemini`) to print raw JSON events instead of plain text — useful for debugging.
 
 **Model invocation:** by default these are model-invokable, meaning Claude can call them autonomously during a conversation. For example, you can say "check on the qwen job from earlier" and Claude will run `/acp-jobs qwen` itself.
 
@@ -149,6 +156,9 @@ Per-session state files live in `~/.cache/claude-acp-bridge/sessions/`:
 | `<session>.watcher.pid` | PID of the running watcher daemon |
 | `<session>.pending` | Queued completion reports awaiting the next user turn |
 | `<session>.pending.inflight` | Transient — drained-but-not-yet-injected reports |
+| `<session>.permission.pending` | Queued permission requests awaiting approval |
+| `<session>.permission.pending.inflight` | Transient — drained permission requests |
+| `<session>.watcher.json` | Watcher health/observability (last poll time, results, errors) |
 
 All are removed on `SessionEnd`.
 
@@ -157,6 +167,7 @@ All are removed on `SessionEnd`.
 - **Cross-session interference**: because bridges are global singletons, any Claude Code session's `SessionEnd` can close a backend used by another concurrent session. The `activeJobs > 0` guard protects background jobs but not in-flight synchronous prompts from other sessions. Recovery is automatic — next use respawns the bridge.
 - **External bridges aren't tracked**: bridges started outside Claude Code (e.g., by the pi-coding-agent extension) aren't cleaned up by this plugin. Intentional.
 - **State file leaks on crash**: if Claude Code terminates abnormally, the state file is orphaned. Harmless — next `SessionStart` creates a fresh one.
+- **Permission files preserved with active jobs**: when a session ends but a backend is preserved (active jobs > 0), the `<session>.permission.pending` files are also preserved so in-flight permission requests aren't lost. They're cleaned up on the next session end when all jobs have completed.
 
 ## Background job watcher
 
@@ -197,6 +208,9 @@ All configuration is via environment variables. Set them in your shell profile o
 | `ACP_WORKSPACE` | `$PWD` (caller's cwd) | Workspace root the backend should operate on. Default is the current Claude Code session's working directory. Override when you want to dispatch work from one repo to a backend that should act on a different repo — e.g. `ACP_WORKSPACE=/path/to/other/repo /acp-submit qwen "..."`. The bridge updates its `workspaceRoot` on every prompt/submit/resume/new/pick request, so you can target different workspaces across successive invocations. |
 | `ACP_BRIDGE_WATCH_INTERVAL` | `30` | Watcher poll interval in seconds |
 | `ACP_BRIDGE_TELEGRAM_CHAT_ID` | *(unset)* | If set, watcher posts job-completion messages to this Telegram chat ID |
+| `ACP_BRIDGE_DEBUG` | *(unset)* | Set to `1` to enable verbose debug logging (permission params, etc.) |
+| `ACP_GEMINI_YOLO` | `true` | Set to `false` to disable `--yolo` for the Gemini backend (enables permission prompts) |
+| `ACP_QWEN_YOLO` | `true` | Set to `false` to disable `--yolo` for the Qwen backend |
 | `TELEGRAM_BOT_TOKEN` | *(auto)* | Telegram bot token. If unset, read from `~/.claude/channels/telegram/.env` (reuses the Claude Code Telegram plugin's bot) |
 
 ## Telegram notifications (optional)
@@ -235,25 +249,23 @@ The Claude Code Telegram plugin runs one MCP server instance per Claude Code pro
 
 **Workaround:** use one Claude Code session at a time, or run a dedicated bot for the acp-bridge notifier and keep a separate bot for interactive chat with Claude.
 
-## Not implemented (v0.1 explicit non-goals)
+## Not implemented (v0.2 explicit non-goals)
 
 - **Live streaming of `/acp-follow` output** — Claude Code slash commands can't stream; you see the full output only when the job finishes. Manual polling via `/acp-job-status` is the workaround.
 - **Interactive backend pickers** — slash commands require the backend argument; no UI popup like the pi-coding-agent extension.
-- **JSON event mode** (`--no-plain`) — plain text only for legibility.
-- **Direct Telegram → ACP interaction** — you can't drive Qwen/Gemini/Codex directly from a Telegram chat. Would require a standalone daemon independent of Claude Code. See the project roadmap in the design doc.
+- **Direct Telegram → ACP interaction** — you can't drive Qwen/Gemini/Codex directly from a Telegram chat. Would require a standalone daemon independent of Claude Code.
 - **Cross-session job ownership** — the watcher notifies on any backend transition, not just "jobs this session submitted." Polling all three backends is the Option Y trade-off documented in the design.
 
 ## Development
 
-- **Design doc**: `docs/superpowers/specs/2026-04-11-acp-bridge-plugin-design.md`
-- **Implementation plan**: `docs/superpowers/plans/2026-04-11-acp-bridge-plugin.md`
 - **Key files**:
-  - `plugins/acp-bridge/bin/acp-client` — **the bundled ACP client** (single-file Python 3 stdlib implementation; ~1700 lines). Handles the ACP protocol, per-backend Unix-socket RPC, session state, and background job lifecycle. Shells out to external `gemini` / `qwen` / `codex` CLIs for the actual model calls.
-  - `plugins/acp-bridge/commands/*.md` — the 12 slash command definitions
+  - `plugins/acp-bridge/bin/acp-client` — **the bundled ACP client** (single-file Python 3 stdlib implementation; ~2200 lines). Handles the ACP protocol, per-backend Unix-socket RPC, session state, background job lifecycle, and permission monitoring with progressive trust. Shells out to external `gemini` / `qwen` / `codex` CLIs for the actual model calls.
+  - `plugins/acp-bridge/commands/*.md` — the 17 slash command definitions
   - `plugins/acp-bridge/scripts/acp.sh` — shared argument parser and dispatcher that invokes the bundled client
+  - `plugins/acp-bridge/scripts/_lib.sh` — shared helpers (session paths, backend validation, JSON parsing)
   - `plugins/acp-bridge/scripts/session-hook.sh` — SessionStart / SessionEnd handler (tracking + smart cleanup)
-  - `plugins/acp-bridge/scripts/job-watcher.sh` — long-lived daemon poller that queues transition reports and fires Telegram
-  - `plugins/acp-bridge/scripts/inject-pending.sh` — UserPromptSubmit hook that drains queued reports into the model's context and self-heals the watcher
+  - `plugins/acp-bridge/scripts/job-watcher.sh` — long-lived daemon poller that queues transition reports, fires Telegram, and writes health observability JSON
+  - `plugins/acp-bridge/scripts/inject-pending.sh` — UserPromptSubmit hook that drains queued reports and permission requests into the model's context, self-heals the watcher
   - `plugins/acp-bridge/scripts/notify-telegram.sh` — Telegram Bot API helper (HTML-formatted, plain-text-safe)
   - `plugins/acp-bridge/hooks/hooks.json` — hook registration (SessionStart, UserPromptSubmit, SessionEnd)
 
