@@ -109,12 +109,31 @@ run_backend_and_text_command() {
   fi
   is_valid_backend "$BACKEND" || invalid_backend_exit "$BACKEND"
   track_invocation "$BACKEND"
-  "$ACP_CLIENT_BIN" --workspace "$ACP_WORKSPACE" --backend "$BACKEND" "$sub" "$TEXT"
+  "$ACP_CLIENT_BIN" --workspace "$ACP_WORKSPACE" $NO_PLAIN_FLAG --backend "$BACKEND" "$sub" "$TEXT"
 }
 
+run_policy_command() {
+  # Policy accepts: no args (list all), or a subcommand (list/clear/reset)
+  # with optional flags (--session, --all).
+  # Pass everything through to acp-client without backend validation.
+  "$ACP_CLIENT_BIN" --workspace "$ACP_WORKSPACE" policy $ARGS
+}
+
+# Strip a leading --json flag from ARGS for commands that support it.
+# When present, pass --no-plain to acp-client for raw JSON event output.
+NO_PLAIN_FLAG=""
+if [[ "$ARGS" == --json* ]]; then
+  NO_PLAIN_FLAG="--no-plain"
+  ARGS="${ARGS#--json}"
+  ARGS="${ARGS#"${ARGS%%[![:space:]]*}"}"  # trim leading whitespace
+fi
+
 case "$SUBCOMMAND" in
-  status|sessions|jobs|permissions|policy)
+  status|sessions|jobs|permissions)
     run_info_command "$SUBCOMMAND"
+    ;;
+  policy)
+    run_policy_command
     ;;
   close|reset)
     run_backend_only_command "$SUBCOMMAND"
@@ -127,6 +146,9 @@ case "$SUBCOMMAND" in
     ;;
   approve|deny)
     run_backend_and_text_command "$SUBCOMMAND" "<request-id> [--session|--always]"
+    ;;
+  doctor)
+    "$ACP_CLIENT_BIN" --workspace "$ACP_WORKSPACE" doctor
     ;;
   *)
     echo "acp-bridge: unknown subcommand '$SUBCOMMAND'" >&2

@@ -69,7 +69,7 @@ TMP_CURRENT=""
 
 cleanup_and_exit() {
   [ -n "$TMP_CURRENT" ] && rm -f "$TMP_CURRENT"
-  rm -f "$SESSION_PID_FILE"
+  rm -f "$SESSION_PID_FILE" "$SESSION_WATCHER_HEALTH"
   exit 0
 }
 trap cleanup_and_exit TERM INT
@@ -125,7 +125,35 @@ while true; do
   TMP_CURRENT=$(mktemp)
   snapshot_jobs > "$TMP_CURRENT"
 
-  report=$(LAST_FILE="$SESSION_LASTJOBS_FILE" CURR_FILE="$TMP_CURRENT" python3 <<'PY'
+  # Write watcher health file atomically (Feature 2: observability).
+  health_tmp=$(mktemp)
+  HEALTH_FILE="$SESSION_WATCHER_HEALTH" CURR_FILE="$TMP_CURRENT" python3 -c '
+import json, os, time
+
+curr_file = os.environ["CURR_FILE"]
+health_file = os.environ["HEALTH_FILE"]
+poll_results = {}
+try:
+    with open(curr_file) as f:
+        for line in f:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) >= 3 and parts[1] == "__probed__":
+                backend = parts[0]
+                poll_results[backend] = {"ok": True, "jobCount": 0, "error": None}
+            elif len(parts) >= 3 and parts[1].startswith("job_"):
+                backend = parts[0]
+                if backend in poll_results:
+                    poll_results[backend]["jobCount"] += 1
+except Exception:
+    pass
+
+health = {"timestamp": time.time(), "pollResults": poll_results, "errors": []}
+with open(health_file + ".tmp", "w") as f:
+    json.dump(health, f)
+os.replace(health_file + ".tmp", health_file)
+' 2>/dev/null || true
+
+  report=$(LAST_FILE="$SESSION_LASTJOBS_FILE" CURR_FILE="$TMP_CURRENT" ACP_CLIENT_BIN="$ACP_CLIENT_BIN" ACP_WORKSPACE="$ACP_WORKSPACE" python3 <<'PY'
 import os
 
 TERMINAL = {"completed", "succeeded", "failed", "error", "cancelled", "canceled", "done"}
@@ -170,28 +198,44 @@ for (backend, job_id), (curr_status, prompt) in curr_jobs.items():
         transitions.append((backend, job_id, curr_status, prompt))
 
 if transitions:
-    import re
+    import re, subprocess as sp, json
+
+    acp_client = os.environ.get("ACP_CLIENT_BIN", "")
+    acp_workspace = os.environ.get("ACP_WORKSPACE", ".")
+
+    def get_job_details(backend: str, job_id: str) -> dict:
+        """Query job-status for elapsed time and event count."""
+        if not acp_client:
+            return {}
+        try:
+            out = sp.run(
+                [acp_client, "--workspace", acp_workspace, "--backend", backend, "job-status", job_id],
+                capture_output=True, text=True, timeout=10,
+            )
+            if out.returncode == 0 and out.stdout.strip():
+                return json.loads(out.stdout)
+        except Exception:
+            pass
+        return {}
+
+    def format_elapsed(started: float, completed: float) -> str:
+        secs = int(completed - started)
+        if secs < 60:
+            return f"{secs}s"
+        mins, secs = divmod(secs, 60)
+        return f"{mins}m{secs:02d}s"
 
     def summarize_prompt(text: str, max_len: int = 60) -> str:
-        """Turn a raw prompt into a concise task summary.
-
-        Strips filler prefixes like 'You are performing a...' or
-        'Please ...' so the notification reads as an outcome
-        description, not a raw echo of the input.
-        """
+        """Turn a raw prompt into a concise task summary."""
         if not text:
             return ""
-        # Collapse newlines/tabs to spaces (prompts can be multi-line).
         text = " ".join(text.split())
-        # Strip common instruction-style prefixes.
         text = re.sub(
             r"^(You are (performing |doing |implementing |conducting )?|"
             r"Please |I want you to |I need you to |I'd like you to )",
             "", text, count=1, flags=re.IGNORECASE,
         ).strip()
-        # Strip leading articles for cleaner reading after "completed: ".
         text = re.sub(r"^(a |an |the )", "", text, count=1, flags=re.IGNORECASE)
-        # Lowercase the first char (reads better after "completed: ...")
         if text and text[0].isupper():
             text = text[0].lower() + text[1:]
         if len(text) > max_len:
@@ -200,15 +244,25 @@ if transitions:
 
     lines = []
     for b, jid, s, prompt in transitions:
+        details = get_job_details(b, jid)
         summary = summarize_prompt(prompt)
+        elapsed_str = ""
+        events_str = ""
+        if details.get("startedAt") and details.get("completedAt"):
+            elapsed_str = f" in {format_elapsed(details['startedAt'], details['completedAt'])}"
+        event_count = details.get("eventCount")
+        if event_count:
+            events_str = f" ({event_count} events)"
+        meta = f"{elapsed_str}{events_str}"
+
         if s in ("completed", "succeeded", "done"):
-            lines.append(f"✓ {b} completed: {summary}" if summary else f"✓ {b} completed")
+            lines.append(f"✓ {b} completed{meta}: {summary}" if summary else f"✓ {b} completed{meta}")
         elif s in ("failed", "error"):
-            lines.append(f"✗ {b} failed: {summary}" if summary else f"✗ {b} failed")
+            lines.append(f"✗ {b} failed{meta}: {summary}" if summary else f"✗ {b} failed{meta}")
         elif s in ("cancelled", "canceled"):
-            lines.append(f"⊘ {b} cancelled: {summary}" if summary else f"⊘ {b} cancelled")
+            lines.append(f"⊘ {b} cancelled{meta}: {summary}" if summary else f"⊘ {b} cancelled{meta}")
         else:
-            lines.append(f"  {b} {s}: {summary}" if summary else f"  {b} {s}")
+            lines.append(f"  {b} {s}{meta}: {summary}" if summary else f"  {b} {s}{meta}")
         lines.append(f"  /acp-follow {b} {jid}")
         lines.append("")
     print("\n".join(lines).rstrip())

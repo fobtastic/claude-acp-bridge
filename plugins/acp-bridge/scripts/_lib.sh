@@ -62,6 +62,7 @@ except Exception:
 #   SESSION_INFLIGHT_FILE — transient drained file being injected
 #   SESSION_PERM_PENDING  — queued permission requests
 #   SESSION_PERM_INFLIGHT — transient drained permission file
+#   SESSION_WATCHER_HEALTH — watcher health/observability JSON
 session_paths() {
   local sid="$1"
   SESSION_LIST_FILE="$STATE_DIR/${sid}.list"
@@ -71,6 +72,7 @@ session_paths() {
   SESSION_INFLIGHT_FILE="$STATE_DIR/${sid}.pending.inflight"
   SESSION_PERM_PENDING="$STATE_DIR/${sid}.permission.pending"
   SESSION_PERM_INFLIGHT="$STATE_DIR/${sid}.permission.pending.inflight"
+  SESSION_WATCHER_HEALTH="$STATE_DIR/${sid}.watcher.json"
 }
 
 # Human-readable list of backends for error messages: "gemini, qwen, or codex".

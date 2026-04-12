@@ -25,8 +25,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import fnmatch
+import fcntl
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -720,14 +722,17 @@ class ACPBridge:
         action_info = self._extract_action_info(params)
         backend = self.backend
 
-        # 1. Check session rules
-        for rule in reversed(self._session_permission_rules):
+        # 1. Check session rules (most specific first)
+        session_rules = sorted(self._session_permission_rules, key=_rule_specificity, reverse=True)
+        for rule in session_rules:
             if rule_matches(rule, backend, action_info):
                 return self._resolve_from_rule(rule, params)
 
         # 2. Check persistent policy
         policy = load_policy_file()
-        for rule in policy.get("rules", []):
+        persistent_rules = policy.get("rules", [])
+        persistent_rules.sort(key=_rule_specificity, reverse=True)
+        for rule in persistent_rules:
             if rule_matches(rule, backend, action_info):
                 return self._resolve_from_rule(rule, params)
 
@@ -748,8 +753,13 @@ class ACPBridge:
 
         self._pending_permissions[request_id] = (future, perm_request)
 
-        if self.session_id:
-            pending_file = get_session_state_dir() / f"{self.session_id}.permission.pending"
+        # Derive the Claude Code session ID from the environment variable set by
+        # session-hook.sh. It points to STATE_DIR/<session_id>.list.
+        claude_session_file = os.environ.get("CLAUDE_ACP_SESSION_FILE")
+        if claude_session_file:
+            path = Path(claude_session_file)
+            session_id = path.stem
+            pending_file = path.parent / f"{session_id}.permission.pending"
             pending_file.parent.mkdir(parents=True, exist_ok=True)
             with pending_file.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(perm_request) + "\n")
@@ -783,9 +793,11 @@ class ACPBridge:
                 action["type"] = "network"
 
         # If we have path/command in params but not at top level, log it
-        for k, v in params.items():
-            if k not in ("type", "path", "command", "description", "options") and isinstance(v, (str, int, float)):
-                sys.stderr.write(f"[permission-debug] Extra param: {k}={v}\n")
+        if os.environ.get("ACP_BRIDGE_DEBUG") == "1":
+            safe_params = _safe_log_params(params)
+            for k, v in safe_params.items():
+                if k not in ("type", "path", "command", "description", "options") and isinstance(v, (str, int, float)):
+                    sys.stderr.write(f"[permission-debug] Extra param: {k}={v}\n")
 
         return action
 
@@ -1043,6 +1055,24 @@ def get_policy_file_path() -> Path:
     return Path.home() / ".config" / "claude-acp-bridge" / "permission-policy.json"
 
 
+POLICY_LOCK = Path.home() / ".config" / "claude-acp-bridge" / ".policy.lock"
+
+
+def _with_policy_lock(func: Callable) -> Callable:
+    """Decorator: hold an advisory lock on the policy file during read-modify-write."""
+
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        POLICY_LOCK.parent.mkdir(parents=True, exist_ok=True)
+        with open(POLICY_LOCK, "w") as lock_fd:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            try:
+                return func(*args, **kwargs)
+            finally:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+
+    return wrapper
+
+
 def load_policy_file() -> dict[str, Any]:
     path = get_policy_file_path()
     if not path.exists():
@@ -1056,6 +1086,7 @@ def load_policy_file() -> dict[str, Any]:
         return {"version": 1, "rules": []}
 
 
+@_with_policy_lock
 def save_policy_rule(rule: dict[str, Any]) -> None:
     path = get_policy_file_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1068,10 +1099,29 @@ def save_policy_rule(rule: dict[str, Any]) -> None:
     ensure_private_file(path)
 
 
+@_with_policy_lock
 def clear_policy() -> None:
     path = get_policy_file_path()
     if path.exists():
         path.unlink()
+
+
+def _rule_specificity(rule: dict[str, Any]) -> tuple[int, int, int, int, float]:
+    """Higher = more specific. Used as sort key (descending)."""
+    path = rule.get("pathPattern", "*")
+    path_score = 0 if path == "*" else (2 if "*" not in path and "?" not in path else 1)
+    backend_score = 0 if rule.get("backend") == "*" else 1
+    action_score = 0 if rule.get("actionType") == "*" else 1
+    cmd_score = 0 if rule.get("commandPattern", "*") == "*" else 1
+    recency = float(rule.get("createdAt", 0))
+    return (path_score, backend_score, action_score, cmd_score, recency)
+
+
+SENSITIVE_KEYS = re.compile(r"(token|password|secret|key|auth|header|cookie)", re.IGNORECASE)
+
+
+def _safe_log_params(params: dict[str, Any]) -> dict[str, Any]:
+    return {k: ("***" if SENSITIVE_KEYS.search(k) else v) for k, v in params.items()}
 
 
 def rule_matches(rule: dict[str, Any], backend: str, action_info: dict[str, Any]) -> bool:
@@ -1087,6 +1137,12 @@ def rule_matches(rule: dict[str, Any], backend: str, action_info: dict[str, Any]
     if rule_pattern and rule_pattern != "*":
         path = action_info.get("path") or ""
         if not fnmatch.fnmatch(path, rule_pattern):
+            return False
+
+    rule_cmd_pattern = rule.get("commandPattern")
+    if rule_cmd_pattern and rule_cmd_pattern != "*":
+        command = action_info.get("command") or ""
+        if not fnmatch.fnmatch(command, rule_cmd_pattern):
             return False
 
     return True
@@ -1541,11 +1597,27 @@ async def run_server(backend: str, socket_path: Path, workspace_root: Path) -> N
                 future, perm_request = entry
 
                 if scope in ("session", "always"):
+                    action_type = perm_request["action"]["type"]
+                    action_path = perm_request["action"]["path"]
+                    action_command = perm_request["action"]["command"]
+
+                    # Reject rules that would be overly broad:
+                    # - unknown action type (no structured fields to match)
+                    # - shell_command with no command value (would match ALL commands)
+                    if action_type == "unknown" or (action_type == "shell_command" and not action_command):
+                        future.set_result({"outcome": {"outcome": "cancelled"}})
+                        await emit({
+                            "type": "error",
+                            "message": f"Cannot create a {scope} rule: would be overly broad (type={action_type}, command={action_command!r}). Use --once or create a manual policy rule via /acp-policy add."
+                        })
+                        return
+
                     rule = {
                         "id": f"rule_{uuid.uuid4().hex[:8]}",
                         "backend": perm_request["backend"],
-                        "actionType": perm_request["action"]["type"],
-                        "pathPattern": perm_request["action"]["path"] or "*",
+                        "actionType": action_type,
+                        "pathPattern": action_path or "*",
+                        "commandPattern": action_command or "*",
                         "decision": decision,
                         "scope": scope,
                         "createdAt": time.time(),
@@ -1860,7 +1932,7 @@ async def follow_job(socket_path: Path, job_id: str, *, plain: bool = True, poll
 
 async def main_async() -> int:
     parser = argparse.ArgumentParser(description="Persistent ACP bridge for Gemini, Qwen, and Codex")
-    parser.add_argument("command", choices=["serve", "prompt", "resume", "pick", "status", "reset", "close", "sessions", "new", "submit", "jobs", "follow", "job-status", "permissions", "approve", "deny", "policy"], help="Bridge command")
+    parser.add_argument("command", choices=["serve", "prompt", "resume", "pick", "status", "reset", "close", "sessions", "new", "submit", "jobs", "follow", "job-status", "permissions", "approve", "deny", "policy", "doctor"], help="Bridge command")
     parser.add_argument("text", nargs="*", help="Prompt text, job id, or request id")
     parser.add_argument("--backend", choices=SUPPORTED_BACKENDS, default="gemini", help="ACP backend to use")
     parser.add_argument("--socket", default=None, help="Unix socket path")
@@ -1989,9 +2061,10 @@ async def main_async() -> int:
             if not rules:
                 print("No policy rules.")
             else:
-                print("ID        DECISION BACKEND  ACTION       PATTERN (SCOPE)")
+                print("ID        DECISION BACKEND  ACTION       PATTERN          COMMAND (SCOPE)")
                 for r in rules:
-                    print(f"{r['id']:<9} {r['decision'].upper():<8} {r['backend']:<8} {r['actionType']:<12} {r['pathPattern']} ({r['scope']})")
+                    cmd = r.get("commandPattern", "*")
+                    print(f"{r['id']:<9} {r['decision'].upper():<8} {r['backend']:<8} {r['actionType']:<12} {r['pathPattern']:<16} {cmd} ({r['scope']})")
         elif sub == "clear":
             scope = "session"
             if "--all" in args.text:
@@ -2056,6 +2129,77 @@ async def main_async() -> int:
             session_mode=session_mode,
             session_id=session_id,
         )
+
+    if args.command == "doctor":
+        lines: list[str] = []
+
+        # Check backend CLIs
+        cli_names = {"gemini": "gemini", "qwen": "qwen", "codex": "codex"}
+        for b, cli in cli_names.items():
+            path = shutil.which(cli)
+            if path:
+                lines.append(f"  \u2713 {b} CLI found: {path}")
+            else:
+                lines.append(f"  \u2717 {b} CLI not found ({cli})")
+
+        # Check bridge sockets
+        for b in SUPPORTED_BACKENDS:
+            rt = get_runtime_paths(b)
+            if rt.socket.exists():
+                try:
+                    result = await send_simple_action(rt.socket, "status")
+                    pid = result.get("pid", "?")
+                    lines.append(f"  \u2713 {b} bridge: alive (PID {pid})")
+                except Exception as exc:
+                    lines.append(f"  \u2717 {b} bridge: socket exists but error: {exc}")
+            else:
+                lines.append(f"  - {b} bridge: not running")
+
+        # Check watcher
+        session_file = os.environ.get("CLAUDE_ACP_SESSION_FILE")
+        if session_file:
+            sid = Path(session_file).stem
+            state_dir = Path(session_file).parent
+            pid_file = state_dir / f"{sid}.watcher.pid"
+            if pid_file.exists():
+                try:
+                    pid = int(pid_file.read_text().strip())
+                    os.kill(pid, 0)
+                    lines.append(f"  \u2713 watcher: alive (PID {pid})")
+                except (ValueError, ProcessLookupError, PermissionError):
+                    lines.append(f"  \u2717 watcher: stale PID file")
+            else:
+                lines.append(f"  - watcher: not running")
+        else:
+            lines.append(f"  - watcher: no session (CLAUDE_ACP_SESSION_FILE not set)")
+
+        # Check state dir
+        cache_dir = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "claude-acp-bridge" / "sessions"
+        if cache_dir.exists() and os.access(cache_dir, os.W_OK):
+            lines.append(f"  \u2713 state dir: {cache_dir} (writable)")
+        elif cache_dir.exists():
+            lines.append(f"  \u2717 state dir: {cache_dir} (not writable)")
+        else:
+            lines.append(f"  - state dir: {cache_dir} (does not exist yet)")
+
+        # Check Telegram config
+        chat_id = os.environ.get("ACP_BRIDGE_TELEGRAM_CHAT_ID")
+        if chat_id:
+            lines.append(f"  \u2713 telegram: configured (chat_id={chat_id})")
+        else:
+            lines.append(f"  - telegram: not configured")
+
+        # Check policy file
+        policy_path = get_policy_file_path()
+        if policy_path.exists():
+            policy = load_policy_file()
+            n = len(policy.get("rules", []))
+            lines.append(f"  \u2713 policy: {n} rule(s) in {policy_path}")
+        else:
+            lines.append(f"  - policy: no rules (file does not exist)")
+
+        print("\n".join(lines))
+        return 0
 
     return 0
 

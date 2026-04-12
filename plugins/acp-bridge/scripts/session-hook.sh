@@ -45,8 +45,7 @@ case "$ACTION" in
       fi
       rm -f "$SESSION_PID_FILE"
     fi
-    rm -f "$SESSION_LASTJOBS_FILE" "$SESSION_PENDING_FILE" "$SESSION_INFLIGHT_FILE"
-    rm -f "$SESSION_PERM_PENDING" "$SESSION_PERM_INFLIGHT"
+    rm -f "$SESSION_LASTJOBS_FILE" "$SESSION_PENDING_FILE" "$SESSION_INFLIGHT_FILE" "$SESSION_WATCHER_HEALTH"
 
     if [ ! -f "$SESSION_LIST_FILE" ]; then
       exit 0
@@ -60,6 +59,7 @@ case "$ACTION" in
     # Iterate tracked backends (deduped at read time — acp.sh always
     # appends, never checks). Skip any backend with active background
     # jobs; close the rest.
+    any_preserved=0
     while IFS= read -r backend; do
       [ -z "$backend" ] && continue
 
@@ -74,12 +74,18 @@ except Exception:
 ' <<<"$status_json" 2>/dev/null || echo "0")
 
       if [ "$active_jobs" -gt 0 ]; then
+        any_preserved=1
         echo "acp-bridge: skipping ${backend} — ${active_jobs} active jobs" >&2
       else
         "$ACP_CLIENT_BIN" --workspace "$ACP_WORKSPACE" --backend "$backend" close >/dev/null 2>&1 || true
         echo "acp-bridge: closed idle ${backend}" >&2
       fi
     done < <(sort -u "$SESSION_LIST_FILE")
+
+    # Only delete permission files if nothing was preserved.
+    if [ "$any_preserved" = "0" ]; then
+        rm -f "$SESSION_PERM_PENDING" "$SESSION_PERM_INFLIGHT"
+    fi
 
     rm -f "$SESSION_LIST_FILE"
     ;;
