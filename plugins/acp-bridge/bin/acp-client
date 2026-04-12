@@ -38,6 +38,7 @@ from typing import Any, Awaitable, Callable, Optional
 
 DEFAULT_WORKSPACE = Path.cwd()
 DEFAULT_OUTPUT_BYTE_LIMIT = 1_048_576
+SOCKET_STREAM_LIMIT = 8 * 1024 * 1024  # 8MB - large enough for full job payloads
 SUPPORTED_BACKENDS = ("gemini", "qwen", "codex")
 
 JsonValue = dict[str, Any]
@@ -283,6 +284,24 @@ class ACPBridge:
         if self.process and self.process.returncode is None and self._initialized:
             return
 
+        # If a previous start() spawned the process but initialization didn't
+        # complete, tear it down before creating a new one so we don't orphan it.
+        if self.process and self.process.returncode is None:
+            try:
+                self.process.terminate()
+                await asyncio.wait_for(self.process.wait(), timeout=3)
+            except asyncio.TimeoutError:
+                self.process.kill()
+                await self.process.wait()
+            except ProcessLookupError:
+                pass
+        for _task in (self._stdout_task, self._stderr_task):
+            if _task and not _task.done():
+                _task.cancel()
+        self.process = None
+        self._stdout_task = None
+        self._stderr_task = None
+
         self.workspace_root.mkdir(parents=True, exist_ok=True)
         ensure_private_runtime_tree(self.runtime_paths.root)
         ensure_private_runtime_tree(self.runtime_paths.log.parent)
@@ -326,13 +345,14 @@ class ACPBridge:
         session_id: Optional[str] = None,
     ) -> dict[str, Any]:
         await self.start()
-        await self.switch_session(session_mode=session_mode, session_id=session_id)
-        if not self.session_id:
-            await self._new_session()
-        if not self.session_id:
-            raise BridgeError(f"{self.spec.title} session is not ready")
 
         async with self._prompt_lock:
+            await self.switch_session(session_mode=session_mode, session_id=session_id)
+            if not self.session_id:
+                await self._new_session()
+            if not self.session_id:
+                raise BridgeError(f"{self.spec.title} session is not ready")
+
             self._active_event_cb = event_cb
             try:
                 result = await self.request(
@@ -526,36 +546,42 @@ class ACPBridge:
 
     async def _pump_stdout(self) -> None:
         assert self.process and self.process.stdout and self.process.stdin
-        buffer = bytearray()
         while True:
-            chunk = await self.process.stdout.read(1)
-            if not chunk:
-                if buffer:
-                    await self._handle_line(buffer.decode(errors="replace"))
+            try:
+                raw = await self.process.stdout.readline()
+            except asyncio.LimitOverrunError:
+                raw = await self._drain_oversized_line(self.process.stdout)
+            if not raw:
                 self._fail_pending_requests(f"{self.spec.title} ACP stdout closed")
                 return
-            if chunk == b"\n":
-                line = buffer.decode(errors="replace")
-                buffer.clear()
-                if line.strip():
-                    await self._handle_line(line)
-            else:
-                buffer.extend(chunk)
+            line = raw.decode(errors="replace")
+            if line.strip():
+                await self._handle_line(line)
+
+    async def _drain_oversized_line(self, stream: asyncio.StreamReader) -> bytes:
+        parts: list[bytes] = []
+        while True:
+            try:
+                chunk = await stream.readuntil(b"\n")
+                parts.append(chunk)
+                return b"".join(parts)
+            except asyncio.LimitOverrunError as exc:
+                parts.append(await stream.readexactly(exc.consumed))
+            except asyncio.IncompleteReadError as exc:
+                parts.append(exc.partial)
+                return b"".join(parts)
 
     async def _pump_stderr(self) -> None:
         assert self.process and self.process.stderr
-        ensure_private_runtime_tree(self.runtime_paths.log.parent)
-        with self.runtime_paths.log.open("a", encoding="utf-8") as log:
-            ensure_private_file(self.runtime_paths.log)
-            while True:
-                chunk = await self.process.stderr.read(4096)
-                if not chunk:
-                    return
-                text = chunk.decode(errors="replace")
-                log.write(text)
-                log.flush()
-                sys.stderr.write(text)
-                sys.stderr.flush()
+        # The server process stdout+stderr are redirected to bridge.log by
+        # start_server_process() - sys.stderr.write goes to that same file
+        # via the kernel fd redirect. No need to also open the log manually.
+        while True:
+            chunk = await self.process.stderr.read(4096)
+            if not chunk:
+                return
+            sys.stderr.write(chunk.decode(errors="replace"))
+            sys.stderr.flush()
 
     async def _handle_line(self, raw_line: str) -> None:
         line = raw_line.strip()
@@ -1113,7 +1139,7 @@ def start_server_process(script_path: Path, backend: str, socket_path: Path, wor
 
 
 async def connect_client(socket_path: Path) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-    return await asyncio.open_unix_connection(str(socket_path))
+    return await asyncio.open_unix_connection(str(socket_path), limit=SOCKET_STREAM_LIMIT)
 
 
 async def _send_socket_request(socket_path: Path, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1382,7 +1408,7 @@ async def run_server(backend: str, socket_path: Path, workspace_root: Path) -> N
             writer.close()
             await writer.wait_closed()
 
-    server = await asyncio.start_unix_server(handle_connection, path=str(socket_path))
+    server = await asyncio.start_unix_server(handle_connection, path=str(socket_path), limit=SOCKET_STREAM_LIMIT)
     ensure_private_file(socket_path)
     loop = asyncio.get_running_loop()
 
@@ -1430,7 +1456,13 @@ async def ensure_server(backend: str, socket_path: Path, workspace_root: Path) -
                 pass
 
     await asyncio.to_thread(start_server_process, Path(__file__).resolve(), backend, socket_path, workspace_root)
-    await wait_for_socket(socket_path)
+    try:
+        await wait_for_socket(socket_path)
+    except TimeoutError as exc:
+        raise BridgeError(
+            f"Timed out waiting for {backend} bridge to start at {socket_path}. "
+            f"Check that the '{backend}' CLI is installed and responsive."
+        ) from exc
 
 
 async def fetch_sessions(backend: str, socket_path: Path, workspace_root: Path, cursor: Optional[str] = None) -> dict[str, Any]:
