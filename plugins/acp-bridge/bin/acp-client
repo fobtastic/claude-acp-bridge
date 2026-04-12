@@ -333,7 +333,7 @@ class ACPBridge:
         try:
             return await future
         finally:
-            if not future.done():
+            if self._pending.get(request_id) is future:
                 self._pending.pop(request_id, None)
 
     async def prompt(
@@ -343,10 +343,13 @@ class ACPBridge:
         *,
         session_mode: Optional[str] = None,
         session_id: Optional[str] = None,
+        workspace_root: Optional[Path] = None,
     ) -> dict[str, Any]:
         await self.start()
 
         async with self._prompt_lock:
+            if workspace_root is not None:
+                self.workspace_root = workspace_root.resolve()
             await self.switch_session(session_mode=session_mode, session_id=session_id)
             if not self.session_id:
                 await self._new_session()
@@ -1273,7 +1276,13 @@ async def run_server(backend: str, socket_path: Path, workspace_root: Path) -> N
             await append_job_event(job, event)
 
         try:
-            await bridge.prompt(job.prompt, event_cb=record, session_mode=job.session_mode, session_id=job.session_id)
+            await bridge.prompt(
+                job.prompt,
+                event_cb=record,
+                session_mode=job.session_mode,
+                session_id=job.session_id,
+                workspace_root=Path(job.workspace_root) if job.workspace_root else None,
+            )
             if not job.done_event.is_set():
                 job.status = "completed"
                 job.completed_at = time.time()
@@ -1294,8 +1303,7 @@ async def run_server(backend: str, socket_path: Path, workspace_root: Path) -> N
                 return
             request = json.loads(line.decode(errors="replace"))
             action = request.get("action", "prompt")
-            if request.get("workspaceRoot"):
-                bridge.workspace_root = Path(request["workspaceRoot"]).resolve()
+            req_workspace = Path(request["workspaceRoot"]).resolve() if request.get("workspaceRoot") else None
 
             if action == "reset":
                 await bridge.reset()
@@ -1354,7 +1362,23 @@ async def run_server(backend: str, socket_path: Path, workspace_root: Path) -> N
                     await emit({"type": "error", "message": f"Unknown job: {job_id}"})
                     return
                 offset = int(request.get("offset") or 0)
-                await emit({"type": "done", "result": {"events": job.events[offset:], "nextOffset": len(job.events), "done": job.done_event.is_set(), "status": job.status}})
+                limit_events = int(request.get("limitEvents") or 500)
+                limit_bytes = int(request.get("limitBytes") or 4 * 1024 * 1024)  # 4MB
+
+                events_slice = job.events[offset : offset + limit_events]
+                returned_events = []
+                bytes_accumulated = 0
+                for ev in events_slice:
+                    ev_json = json.dumps(ev, ensure_ascii=False)
+                    ev_size = len(ev_json.encode()) + 2  # +2 for envelope/comma/overhead estimate
+                    if returned_events and bytes_accumulated + ev_size > limit_bytes:
+                        break
+                    returned_events.append(ev)
+                    bytes_accumulated += ev_size
+
+                next_offset = offset + len(returned_events)
+                is_done = job.done_event.is_set() and next_offset == len(job.events)
+                await emit({"type": "done", "result": {"events": returned_events, "nextOffset": next_offset, "done": is_done, "status": job.status}})
                 return
 
             if action == "submit_prompt":
@@ -1375,7 +1399,7 @@ async def run_server(backend: str, socket_path: Path, workspace_root: Path) -> N
                     job_id=f"job_{uuid.uuid4().hex[:12]}",
                     backend=bridge.backend,
                     prompt=str(prompt),
-                    workspace_root=str(bridge.workspace_root),
+                    workspace_root=str(req_workspace or bridge.workspace_root),
                     session_mode=session_mode,
                     session_id=session_id,
                 )
@@ -1398,7 +1422,7 @@ async def run_server(backend: str, socket_path: Path, workspace_root: Path) -> N
                     await emit({"type": "done", "result": {"cancelled": True}})
                     return
                 session_mode = None
-            await bridge.prompt(str(prompt), event_cb=emit, session_mode=session_mode, session_id=session_id)
+            await bridge.prompt(str(prompt), event_cb=emit, session_mode=session_mode, session_id=session_id, workspace_root=req_workspace)
         except Exception as exc:
             try:
                 await emit({"type": "error", "message": str(exc)})
@@ -1517,8 +1541,8 @@ async def get_job_status(socket_path: Path, job_id: str) -> dict[str, Any]:
     return await _send_socket_request(socket_path, {"action": "job_status", "jobId": job_id})
 
 
-async def get_job_events(socket_path: Path, job_id: str, offset: int = 0) -> dict[str, Any]:
-    return await _send_socket_request(socket_path, {"action": "job_events", "jobId": job_id, "offset": offset})
+async def get_job_events(socket_path: Path, job_id: str, offset: int = 0, limit_events: int = 500, limit_bytes: int = 4 * 1024 * 1024) -> dict[str, Any]:
+    return await _send_socket_request(socket_path, {"action": "job_events", "jobId": job_id, "offset": offset, "limitEvents": limit_events, "limitBytes": limit_bytes})
 
 
 async def resolve_prompt_session(
@@ -1567,7 +1591,7 @@ async def follow_job(socket_path: Path, job_id: str, *, plain: bool = True, poll
     while True:
         result = await get_job_events(socket_path, job_id, offset)
         events = result.get("events") or []
-        offset = int(result.get("nextOffset") or offset)
+        new_offset = int(result.get("nextOffset") or offset)
         for event in events:
             kind = event.get("type")
             if kind == "chunk":
@@ -1591,6 +1615,11 @@ async def follow_job(socket_path: Path, job_id: str, *, plain: bool = True, poll
             elif kind == "error":
                 print(event.get("message", "Unknown bridge error"), file=sys.stderr)
                 return 1
+
+        if new_offset > offset:
+            offset = new_offset
+            continue
+
         if result.get("done"):
             return 0 if result.get("status") == "completed" else 1
         await asyncio.sleep(poll_interval)

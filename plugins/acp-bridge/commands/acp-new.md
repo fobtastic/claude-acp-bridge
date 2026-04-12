@@ -4,6 +4,6 @@ argument-hint: '<backend> <text>'
 allowed-tools: Bash
 ---
 
-!`"${CLAUDE_PLUGIN_ROOT}/scripts/acp.sh" new $ARGUMENTS`
+!`"${CLAUDE_PLUGIN_ROOT}/scripts/acp.sh" new "$ARGUMENTS"`
 
 Present the bridge response verbatim. Do not summarize.

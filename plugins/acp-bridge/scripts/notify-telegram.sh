@@ -55,6 +55,8 @@ ESCAPED_BODY=${ESCAPED_BODY//>/\&gt;}
 FULL_MESSAGE=$(printf '<b>acp-bridge</b>\n\n%s' "$ESCAPED_BODY")
 
 status=$(curl -sS -o /dev/null -w '%{http_code}' \
+  --connect-timeout 5 \
+  --max-time 15 \
   "https://api.telegram.org/bot${TOKEN}/sendMessage" \
   --data-urlencode "chat_id=${CHAT_ID}" \
   --data-urlencode "text=${FULL_MESSAGE}" \
