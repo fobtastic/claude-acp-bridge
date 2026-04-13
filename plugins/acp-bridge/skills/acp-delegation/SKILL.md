@@ -1,13 +1,15 @@
 ---
 name: acp-delegation
-description: Use when the user wants Claude Code to delegate coding, research, review, implementation, test-fixing, or other long-running work to Gemini, Qwen, or Codex through the claude-acp-bridge plugin. Also use when checking, following, resuming, approving, denying, or managing ACP bridge background jobs and permissions.
+description: Use when the user wants Claude Code to delegate coding, research, review, implementation, test-fixing, or other long-running work to Gemini, Qwen, or Codex through the claude-acp-bridge plugin. Also use when submitting, checking, following, canceling, approving, denying, or managing ACP bridge background tasks and permissions.
 ---
 
 # ACP Delegation
 
 Use the ACP bridge to delegate bounded work to another agent while Claude Code remains the coordinator.
 
-The bridge talks to ACP-capable/local backends such as Gemini, Qwen, and Codex. Treat it as a background delegation system: package the task clearly, submit it, monitor it, handle permission requests, then verify the result before reporting success.
+The bridge talks to ACP-capable/local backends such as Gemini, Qwen, and Codex. Treat it as a background task system: package the task clearly, submit it, monitor it, handle permission requests, then verify the result before reporting success.
+
+Important: do not replace ACP or assume there is a public A2A server. The bridge still talks to Gemini, Qwen, and Codex through its ACP client/backend machinery. The task lifecycle vocabulary is the bridge's internal model and command language.
 
 ## When To Delegate
 
@@ -16,7 +18,7 @@ Use ACP delegation when:
 - The task can be described with a clear workspace, goal, scope, and stop conditions.
 - Another agent can inspect or edit a repository independently.
 - The user asks to hand work to another agent.
-- The user asks to check, follow, or manage existing ACP jobs.
+- The user asks to check, follow, cancel, or manage existing ACP tasks/jobs.
 
 Prefer working locally when:
 - The task is small or urgent.
@@ -50,23 +52,33 @@ Submit background work:
 /acp-submit <backend> "<delegation prompt>"
 ```
 
-List jobs:
+List tasks:
 
 ```text
 /acp-jobs
 /acp-jobs <backend>
+/acp-tasks
+/acp-tasks <backend>
 ```
 
-Inspect one job:
+Inspect one task:
 
 ```text
-/acp-job-status <backend> <job-id>
+/acp-job-status <backend> <task-id>
+/acp-task <backend> <task-id>
 ```
 
-Wait for one job to finish:
+Follow/watch one task until terminal:
 
 ```text
-/acp-follow <backend> <job-id>
+/acp-follow <backend> <task-id>
+/acp-watch <backend> <task-id>
+```
+
+Cancel a task best-effort:
+
+```text
+/acp-cancel <backend> <task-id>
 ```
 
 Manage permission requests:
@@ -84,7 +96,13 @@ Close an idle bridge:
 /acp-close <backend>
 ```
 
-Do not close a backend while it has active jobs.
+Do not close a backend while it has active tasks.
+
+The legacy command names remain valid:
+- `/acp-submit` creates a task and returns a task ID. Existing job IDs are task IDs where possible.
+- `/acp-jobs` lists tasks.
+- `/acp-job-status` gets one task.
+- `/acp-follow` follows/subscribes to one task by polling until terminal.
 
 ## Delegation Workflow
 
@@ -92,9 +110,9 @@ Do not close a backend while it has active jobs.
 2. Identify the backend, workspace, branch expectations, task scope, and success criteria.
 3. Write a complete delegation prompt.
 4. Submit the work with `/acp-submit`.
-5. Record the returned job ID in the conversation.
+5. Record the returned task ID in the conversation.
 6. Continue useful non-overlapping work locally if possible.
-7. Check status with `/acp-jobs` or `/acp-job-status`.
+7. Check status with `/acp-jobs`, `/acp-tasks`, `/acp-job-status`, or `/acp-task`.
 8. Use `/acp-follow` when the result is needed.
 9. Inspect the delegated agent's result before trusting it.
 10. Run relevant tests or checks when practical.
@@ -164,7 +182,7 @@ Final report:
 
 ## Status Model
 
-Interpret bridge jobs as tasks with lifecycle states:
+Interpret bridge work as tasks with lifecycle states:
 
 - `submitted`: accepted but not confirmed running
 - `working`: backend is processing
@@ -173,12 +191,25 @@ Interpret bridge jobs as tasks with lifecycle states:
 - `completed`: successful terminal state
 - `failed`: failed terminal state
 - `canceled`: canceled terminal state
+- `rejected`: bridge or backend refused to run the task
 - `unknown`: status could not be determined
 
-For active jobs, check again later or follow them.
-For terminal jobs, read the final output and verify any claimed changes.
+Terminal states are `completed`, `failed`, `canceled`, and `rejected`.
+Interrupted states are `input_required` and `auth_required`.
+Active states are `submitted`, `working`, `input_required`, and `auth_required`.
+
+For active tasks, check again later or follow them.
+For terminal tasks, read the final artifacts/output and verify any claimed changes.
 For `input_required`, inspect permissions before approving.
 For `auth_required`, ask the user to authenticate the backend.
+
+Task snapshots may include:
+- `id`, `backend`, `contextId`, `workspaceRoot`
+- `status.state`, `status.message`, `status.timestamp`
+- `createdAt`, `updatedAt`, `completedAt`
+- `prompt`, limited `history`, `artifacts`, and backend-specific `metadata`
+
+Use artifacts for durable outputs such as final responses, summaries, raw transcript/job record paths, diffs, test results, error logs, and permission audit summaries. Do not treat every progress line as an artifact.
 
 ## Permission Rules
 
@@ -198,7 +229,7 @@ Never approve:
 
 ## Result Handling
 
-When a delegated job completes:
+When a delegated task completes:
 1. Read the full result with `/acp-follow` or `/acp-job-status`.
 2. Inspect any changed files before summarizing.
 3. Run relevant tests if they were not run.
@@ -250,4 +281,4 @@ If delegating while also working locally, avoid overlapping file ownership.
 
 If a delegated agent changes files, inspect those changes before building on them.
 
-Keep the user informed of submitted backend, job ID, and what you will do while it runs.
+Keep the user informed of submitted backend, task ID, current state, and what you will do while it runs.

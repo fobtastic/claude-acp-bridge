@@ -5,13 +5,13 @@
   },
   "metadata": {
     "description": "Personal Claude Code plugin: ACP bridge wrapper for Gemini, Qwen, and Codex",
-    "version": "0.2.0"
+    "version": "0.2.1"
   },
   "plugins": [
     {
       "name": "acp-bridge",
       "description": "Persistent ACP bridge for Gemini, Qwen, and Codex via ~/agent-extensions/acp-tool",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "author": {
         "name": "Chris Tou"
       },
