@@ -1,6 +1,6 @@
 {
   "name": "acp-bridge",
-  "version": "0.1.0",
+  "version": "0.2.1",
   "description": "Self-contained persistent ACP bridge for Gemini, Qwen, and Codex backends. Bundles the Python acp-client under bin/. Requires the external gemini/qwen/codex CLIs installed separately.",
   "author": {
     "name": "Chris Tou",
